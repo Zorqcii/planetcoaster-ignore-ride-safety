@@ -8,8 +8,9 @@ Let guests board and ride incomplete or untested roller coasters, without changi
 
 ## Milestones
 1. The native helper gets reliable information about which rides are untested. **Done (0.2.0-exp.1), see results below.**
-2. Find out whether guests can board an untested or incomplete ride, and whether it dispatches with them. **Stage 0.2.0-exp.3 (current).**
-3. Operation after a crash. Investigated separately, only after milestone 2.
+2. Find out whether guests can board an untested or incomplete ride, and whether it dispatches with them. **Done (0.2.0-exp.3).**
+3. Operation after a crash: the ride stays open and trains respawn for the next riders. **Stage 0.2.0-exp.4 (current).**
+4. (Later phase, owner request) Riders stay at the crash site and walk back, as in RollerCoaster Tycoon.
 
 ## Earlier findings (from the pre-release experiment), re-checked
 | Finding | Status |
@@ -70,3 +71,16 @@ Both packages use the same folder name, so only one version and one DLL can be l
   that has the rated bits set (listed rides only), then runs the original prologue bytes from a trampoline and continues in the function.
 * The four experimental sites and eight fingerprints are checked before applying. All-or-nothing with rollback.
 * Question: do guests now pass the entrance, queue, board, and dispatch with the train?
+
+## Stage 3 result (0.2.0-exp.3, manual test 2026-10-03)
+* **Guests entered the queue, boarded the unfinished coaster and dispatched with the train. Milestone 2 achieved.**
+* The trains left the track, crashed and exploded, and riders were placed at the exit. The ride then went to **closed**.
+
+## Stage 4 (0.2.0-exp.4): keep the ride open after a crash
+* When a crashed train is removed, the game's train-removed handler (`0x1405d3fb0`) asks `IsClosed` and, if the ride is not closed,
+  closes it (then runs a close follow-up). Its `call IsClosed` (`0x1405d40aa`) is redirected: for rides on the open-untested list it answers
+  "closed", so the handler takes the game's own already-closed path. All other rides are answered by the game's `IsClosed`.
+  The earlier pre-release attempt at this relied on the broken ride-table lookup; this version uses the working Lua list.
+* Diagnostic, log only: the close-request function (`0x140537510`) is entered through a hook that records the calling address for
+  listed rides. It never blocks a close, so the player can always close the ride. If the ride still closes, the log names the path.
+* Question: does the ride stay open and keep cycling (train respawns at the station, next riders board)?

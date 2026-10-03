@@ -55,8 +55,12 @@ static struct xsite g_exp_sites[] = {
     {0x1406a2990ULL, 6, {0x40, 0x55, 0x56, 0x57, 0x41, 0x56}, {0}},
     /* 3: join check B entry (0x1406a3470): mov [rsp+0x20],r9 -> jmp stub2 */
     {0x1406a3470ULL, 5, {0x4c, 0x89, 0x4c, 0x24, 0x20}, {0}},
+    /* 4: train-removed handler 0x1405d3fb0: call IsClosed (0x140537170) -> call stub3 (exp_isclosed) */
+    {0x1405d40aaULL, 5, {0xe8, 0xc1, 0x30, 0xf6, 0xff}, {0}},
+    /* 5: close-request function 0x140537510 entry: mov [rsp+0x18],rsi -> jmp stub4 (log only) */
+    {0x140537510ULL, 5, {0x48, 0x89, 0x74, 0x24, 0x18}, {0}},
 };
-#define EXP_NSITES 4
+#define EXP_NSITES 6
 
 static const struct fp g_exp_fps[] = {
     /* open gate: mov ecx,[rdi+0xc] ; test al,al ; jne ; test ecx,ecx ; (je) ; mov eax,[rdi+0x10] */
@@ -72,6 +76,11 @@ static const struct fp g_exp_fps[] = {
     {0x1406a29dbULL, 13, {0x4c, 0x8b, 0x65, 0x77, 0x41, 0x8b, 0x44, 0x24, 0x64, 0x83, 0xe0, 0x0d, 0x3c}},
     /* join check B: (prologue) push rbp ; push rbx ; push rsi ; push rdi ; push r14 ; push r15 ; lea rbp,[rsp-0x208] */
     {0x1406a3475ULL, 11, {0x55, 0x53, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xac}},
+    /* train-removed handler: mov rcx,[r14+0x2a0] ; (call IsClosed) ; test al,al ; jne +0x43 ; ... call close */
+    {0x1405d40a3ULL, 7, {0x49, 0x8b, 0x8e, 0xa0, 0x02, 0x00, 0x00}},
+    {0x1405d40afULL, 4, {0x84, 0xc0, 0x75, 0x43}},
+    /* close-request function: (mov [rsp+0x18],rsi) ; push rdi ; sub rsp,0x20 ; mov r8,[rdx] ; mov rdi,rcx */
+    {0x140537515ULL, 11, {0x57, 0x48, 0x83, 0xec, 0x20, 0x4c, 0x8b, 0x02, 0x48, 0x8b, 0xf9}},
     /* join check B: mov rax,[rbp+0x260] ; mov eax,[rax+0x64] ; and eax,0xd ; cmp al,0xd  (record = 5th arg) */
     {0x1406a35b2ULL, 15, {0x48, 0x8b, 0x85, 0x60, 0x02, 0x00, 0x00, 0x8b, 0x40, 0x64, 0x83, 0xe0, 0x0d, 0x3c, 0x0d}},
 };
@@ -281,6 +290,57 @@ void exp_join_b(void);
 EXP_JOIN_WRAPPER(exp_join_a, g_exp_join_tramp_a);
 EXP_JOIN_WRAPPER(exp_join_b, g_exp_join_tramp_b);
 
+/* ---- stage 4: keep listed rides open when their train is removed (crash) ------------------ */
+typedef uint8_t (*isclosed_fn)(void *mgr, uint64_t *id);
+#define GAME_ISCLOSED ((isclosed_fn)(uintptr_t)0x140537170ULL)
+static volatile long g_exp_keepopen_count;
+static volatile long g_exp_keepopen_logged;
+
+/* Replaces the `call IsClosed` in the train-removed handler. For a listed (open, untested) ride it
+ * reports "closed", so the handler takes the game's own already-closed path and does not close
+ * the ride (nor run its close follow-up). Everything else is answered by the game's IsClosed. */
+uint8_t exp_isclosed(void *mgr, uint64_t *id)
+{
+    if (g_exp_state && id && exp_listed(*id)) {
+        __sync_fetch_and_add(&g_exp_keepopen_count, 1);
+        return 1;
+    }
+    return GAME_ISCLOSED(mgr, id);
+}
+
+/* Log-only: close requests for listed rides, by calling address (to identify any other path). */
+struct exp_closer { volatile uint64_t caller; volatile uint32_t count; };
+static struct exp_closer g_exp_closers[16];
+
+void exp_close_seen(const uint64_t *id, uint64_t caller)
+{
+    if (!g_exp_state || !id || !exp_listed(*id)) return;
+    for (int i = 0; i < 16; i++) {
+        uint64_t c = g_exp_closers[i].caller;
+        if (c == caller) { __sync_fetch_and_add(&g_exp_closers[i].count, 1); return; }
+        if (c == 0 && __sync_bool_compare_and_swap(&g_exp_closers[i].caller, 0, caller)) {
+            __sync_fetch_and_add(&g_exp_closers[i].count, 1);
+            return;
+        }
+    }
+}
+
+/* Entered by `jmp` from the close function's entry: rcx = manager, rdx = &station id, [rsp] = return
+ * address. Records the request, then runs the original first instruction from a trampoline and
+ * continues in the game function. Never blocks a close. */
+void *g_exp_close_tramp;
+void exp_close_hook(void);
+__asm__(".intel_syntax noprefix\n.text\n.globl exp_close_hook\nexp_close_hook:\n"
+        "    push rcx\n    push rdx\n    push r8\n    push r9\n"
+        "    sub rsp, 0x28\n"
+        "    mov rcx, rdx\n"
+        "    mov rdx, qword ptr [rsp+0x48]\n"
+        "    call exp_close_seen\n"
+        "    add rsp, 0x28\n"
+        "    pop r9\n    pop r8\n    pop rdx\n    pop rcx\n"
+        "    jmp qword ptr [rip + g_exp_close_tramp]\n"
+        ".att_syntax prefix\n");
+
 /* Writes `jmp qword ptr [rip+0] ; dq target` at p (14 bytes). */
 static void put_abs_jmp(uint8_t *p, uint64_t target)
 {
@@ -299,7 +359,9 @@ static uint32_t rel32(uint64_t site, uint64_t target, int *ok)
 /* Allocate the stub page within +-2 GB of the game code and compute the patch bytes.
  * Layout: +0x00 stub0 -> exp_observe ; +0x20 stub1 -> exp_join_a ; +0x40 stub2 -> exp_join_b ;
  *         +0x60 trampoline A: original 6 prologue bytes of 0x1406a2990, then jmp 0x1406a2996 ;
- *         +0x80 trampoline B: original 5 prologue bytes of 0x1406a3470, then jmp 0x1406a3475. */
+ *         +0x80 trampoline B: original 5 prologue bytes of 0x1406a3470, then jmp 0x1406a3475 ;
+ *         +0xa0 stub3 -> exp_isclosed ; +0xc0 stub4 -> exp_close_hook ;
+ *         +0xe0 trampoline C: original 5 bytes of 0x140537510, then jmp 0x140537515. */
 static int exp_prepare_stub(void)
 {
     if (g_exp_stub) return 1;
@@ -316,7 +378,11 @@ static int exp_prepare_stub(void)
     put_abs_jmp(page + 0x66, 0x1406a2996ULL);
     for (int i = 0; i < 5; i++) page[0x80 + i] = g_exp_sites[3].orig[i];
     put_abs_jmp(page + 0x85, 0x1406a3475ULL);
-    FlushInstructionCache(GetCurrentProcess(), page, 0xa0);
+    put_abs_jmp(page + 0xa0, (uint64_t)(uintptr_t)&exp_isclosed);
+    put_abs_jmp(page + 0xc0, (uint64_t)(uintptr_t)&exp_close_hook);
+    for (int i = 0; i < 5; i++) page[0xe0 + i] = g_exp_sites[5].orig[i];
+    put_abs_jmp(page + 0xe5, 0x140537515ULL);
+    FlushInstructionCache(GetCurrentProcess(), page, 0x100);
     int ok = 1;
     uint32_t r;
     r = rel32(g_exp_sites[1].va, (uint64_t)(uintptr_t)(page + 0x00), &ok);   /* call stub0 */
@@ -329,6 +395,13 @@ static int exp_prepare_stub(void)
     r = rel32(g_exp_sites[3].va, (uint64_t)(uintptr_t)(page + 0x40), &ok);   /* jmp stub2 */
     g_exp_sites[3].patch[0] = 0xe9;
     for (int i = 0; i < 4; i++) g_exp_sites[3].patch[1 + i] = (uint8_t)(r >> (8 * i));
+    r = rel32(g_exp_sites[4].va, (uint64_t)(uintptr_t)(page + 0xa0), &ok);   /* call stub3 */
+    g_exp_sites[4].patch[0] = 0xe8;
+    for (int i = 0; i < 4; i++) g_exp_sites[4].patch[1 + i] = (uint8_t)(r >> (8 * i));
+    r = rel32(g_exp_sites[5].va, (uint64_t)(uintptr_t)(page + 0xc0), &ok);   /* jmp stub4 */
+    g_exp_sites[5].patch[0] = 0xe9;
+    for (int i = 0; i < 4; i++) g_exp_sites[5].patch[1 + i] = (uint8_t)(r >> (8 * i));
+    g_exp_close_tramp = page + 0xe0;
     if (!ok) { log_line("experimental: stub out of range"); return 0; }
     g_exp_join_tramp_a = page + 0x60;
     g_exp_join_tramp_b = page + 0x80;
@@ -461,5 +534,22 @@ __declspec(dllexport) int irs_exp_report(void *L)
     if (g_exp_seen_overflow) p = fmt_str(p, " [table full]");
     *p = 0;
     if (any) log_line(buf);
+    long kept = __sync_lock_test_and_set(&g_exp_keepopen_count, 0);
+    if (kept) {
+        char b2[96], *q = b2;
+        q = fmt_str(q, "experimental: kept a listed ride open after its train was removed, times: ");
+        q = fmt_u64(q, (uint64_t)kept); *q = 0;
+        log_line(b2);
+    }
+    for (int i = 0; i < 16; i++) {
+        uint32_t c = __sync_lock_test_and_set(&g_exp_closers[i].count, 0);
+        if (!c) continue;
+        char b3[128], *q = b3;
+        q = fmt_str(q, "experimental: close requested for a listed ride from game code at 0x");
+        uint64_t v = g_exp_closers[i].caller;
+        for (int k = 60; k >= 0; k -= 4) *q++ = "0123456789abcdef"[(v >> k) & 15];
+        q = fmt_str(q, ", times: "); q = fmt_u64(q, c); *q = 0;
+        log_line(b3);
+    }
     return matched ? 1 : 2;
 }

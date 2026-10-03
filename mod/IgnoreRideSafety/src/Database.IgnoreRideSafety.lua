@@ -12,7 +12,7 @@ local pcall = global.pcall
 local ipairs = global.ipairs
 local IgnoreRideSafety = module(...)
 
-IgnoreRideSafety.sVersion = "0.2.0-exp.3 EXPERIMENTAL"
+IgnoreRideSafety.sVersion = "0.2.0-exp.4 EXPERIMENTAL"
 
 -- Status codes returned by the native helper (see native/irs_patch.c)
 IgnoreRideSafety.ST_ON = 1
