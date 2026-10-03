@@ -67,7 +67,7 @@ __declspec(dllimport) DWORD __stdcall SetFilePointer(HANDLE, long, long *, DWORD
 __declspec(dllimport) BOOL __stdcall WriteFile(HANDLE, const void *, DWORD, DWORD *, void *);
 __declspec(dllimport) BOOL __stdcall CloseHandle(HANDLE);
 
-#define IRS_VERSION "0.1.0-beta"
+#define IRS_VERSION "0.2.0-exp.1 EXPERIMENTAL"
 
 /* status codes returned to Lua */
 enum {
@@ -279,3 +279,6 @@ BOOL __stdcall DllMain(HANDLE inst, DWORD reason, void *reserved)
     }
     return 1;
 }
+
+/* Experimental unfinished/untested-ride work (inactive unless enabled from the experimental option). */
+#include "irs_experimental.c"
