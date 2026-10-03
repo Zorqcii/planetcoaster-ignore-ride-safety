@@ -10,7 +10,7 @@ Let guests board and ride incomplete or untested roller coasters, without changi
 1. The native helper gets reliable information about which rides are untested. **Done (0.2.0-exp.1), see results below.**
 2. Find out whether guests can board an untested or incomplete ride, and whether it dispatches with them. **Done (0.2.0-exp.3).**
 3. Operation after a crash: the ride stays open and trains respawn for the next riders. **Done (0.2.0-exp.5).**
-4. (Later phase, owner request) Riders stay at the crash site and walk back, as in RollerCoaster Tycoon.
+4. Riders stay at the crash site and walk back, as in RollerCoaster Tycoon. **Investigation started (0.2.0-exp.6, observe-only).**
 
 ## Earlier findings (from the pre-release experiment), re-checked
 | Finding | Status |
@@ -105,3 +105,16 @@ Both packages use the same folder name, so only one version and one DLL can be l
   no other close requests for the listed ride.
 * Owner confirmed (2026-10-03): the ride's own close button still closes it; unticking the experimental option mid-loop returns the
   ride to normal behaviour; with the experimental option off, the safety and nausea options behave exactly as in 0.1.0-beta.
+
+## Phase 4: RollerCoaster Tycoon-style riders (investigation)
+Published so far: [v0.2.0-exp.5](https://github.com/Zorqcii/planetcoaster-ignore-ride-safety/releases/tag/v0.2.0-exp.5) (separate experimental prerelease).
+
+Findings (static):
+* Coaster crashes are "guest physics incidents" in this game: the achievement system counts `nGuestsInvolved` from `GuestPhysicsIncidentEndedMessage`.
+* The game has `GuestEnteredSoSFromCrashMessage` and `GroupPhysicsRecoveryMessage`, guest state components `GuestPhysics`, `GuestSOS` and `GuestLost`,
+  and a trapped-guest system (`guests:GetTrappedGuestCount` / `GetNextTrappedGuest`). So the engine already has a path for crash victims who are
+  stranded and must recover. The owner observes riders reappearing at the exit instead.
+
+0.2.0-exp.6 (Lua only; native helper unchanged and byte-identical to 0.2.0-exp.5): while the experimental option is on, counts those crash messages,
+records the fields of the first of each kind, and shows them plus the trapped-guest count in the diagnostics list. No behaviour change.
+Question: in this crash type, do riders go through the physics-incident / SOS path, or are they moved straight to the exit?

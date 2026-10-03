@@ -25,6 +25,14 @@ local IgnoreRideSafetyManager = module(..., Mutators.Manager())
 
 local c_nExperimentalInterval = 3.0
 
+-- Crash-related game messages observed (log only) while the experimental option is on.
+local c_tCrashMessages = {
+  "MsgType_GuestPhysicsIncidentEndedMessage",
+  "MsgType_GuestEnteredSoSFromCrashMessage",
+  "MsgType_GroupPhysicsRecoveryMessage",
+  "MsgType_GuestHiddenMessage"
+}
+
 local function S(...)
   return tostring((...))
 end
@@ -35,6 +43,8 @@ IgnoreRideSafetyManager.Init = function(self, _tProperties, _tEnvironment)
   self.nTimer = 0
   self.tDiag = {}
   self.bGuestIdMatch = nil
+  self.tCrashObs = {}
+  self.tCrashHandlers = {}
   if self.tNative then
     for _, sKind in ipairs(IRS.tOptionOrder) do
       self.tStatus[sKind] = IRS.Call(self.tNative[IRS.tOptions[sKind].sDisable])
@@ -69,6 +79,11 @@ IgnoreRideSafetyManager.SetExperimental = function(self, _bEnabled)
   local tExp = IRS.tExperimental
   self.tStatus.experimental = IRS.Call(self.tNative[_bEnabled and tExp.sEnable or tExp.sDisable])
   pcall(self.RefreshAttractionFlags, self)
+  if self.tStatus.experimental == IRS.ST_ON then
+    pcall(self.StartCrashObserver, self)
+  else
+    pcall(self.StopCrashObserver, self)
+  end
   self.nTimer = c_nExperimentalInterval
   return self.tStatus.experimental == (_bEnabled and IRS.ST_ON or IRS.ST_OFF)
 end
@@ -189,10 +204,72 @@ IgnoreRideSafetyManager.UpdateExperimental = function(self)
   self.tDiag = tLines
 end
 
+-- Observe-only: count crash-related messages and keep the fields of the first one of each kind.
+local function DescribeMessage(t)
+  local s = ""
+  if type(t) == "table" then
+    for k, v in pairs(t) do
+      s = s .. " " .. S(k) .. "=" .. S(v)
+    end
+  else
+    s = " " .. S(t)
+  end
+  return s
+end
+
+IgnoreRideSafetyManager.StartCrashObserver = function(self)
+  self:StopCrashObserver()
+  for _, sName in ipairs(c_tCrashMessages) do
+    local nType = api.messaging[sName]
+    if nType ~= nil then
+      local fn = function(_tMessages)
+        local o = self.tCrashObs[sName] or {nCount = 0}
+        for _, tMsg in ipairs(_tMessages or {}) do
+          o.nCount = o.nCount + 1
+          if o.sFirst == nil then
+            o.sFirst = DescribeMessage(tMsg)
+          end
+        end
+        self.tCrashObs[sName] = o
+      end
+      api.messaging.RegisterReceiver(nType, fn)
+      self.tCrashHandlers[nType] = fn
+    else
+      self.tCrashObs[sName] = {nCount = 0, sFirst = "(message type not present in this game)"}
+    end
+  end
+end
+
+IgnoreRideSafetyManager.StopCrashObserver = function(self)
+  for nType, fn in pairs(self.tCrashHandlers or {}) do
+    api.messaging.UnregisterReceiver(nType, fn)
+  end
+  self.tCrashHandlers = {}
+end
+
+IgnoreRideSafetyManager.GetCrashLines = function(self)
+  local tLines = {}
+  local tW = api.world.GetWorldAPIs()
+  local bOk, nTrapped = pcall(tW.guests.GetTrappedGuestCount, tW.guests)
+  tLines[#tLines + 1] = "Crash observer: trapped (SOS) guests now " .. S(bOk and nTrapped or "?")
+  for _, sName in ipairs(c_tCrashMessages) do
+    local o = self.tCrashObs[sName]
+    local sShort = string.gsub(string.gsub(sName, "^MsgType_", ""), "Message$", "")
+    tLines[#tLines + 1] = sShort .. ": " .. S(o and o.nCount or 0) .. ((o and o.sFirst) and (" | first:" .. string.sub(o.sFirst, 1, 160)) or "")
+  end
+  return tLines
+end
+
 IgnoreRideSafetyManager.GetDiagnosticLines = function(self)
   local tLines = {"Experimental diagnostics (snapshot when this menu opened):"}
   for _, s in ipairs(self.tDiag) do
     tLines[#tLines + 1] = s
+  end
+  local bOk, tCrash = pcall(self.GetCrashLines, self)
+  if bOk then
+    for _, s in ipairs(tCrash) do
+      tLines[#tLines + 1] = s
+    end
   end
   return tLines
 end
@@ -215,6 +292,7 @@ IgnoreRideSafetyManager.Deactivate = function(self)
 end
 
 IgnoreRideSafetyManager.Shutdown = function(self)
+  pcall(self.StopCrashObserver, self)
   if self.tNative then
     for _, sKind in ipairs(IRS.tOptionOrder) do
       IRS.Call(self.tNative[IRS.tOptions[sKind].sDisable])

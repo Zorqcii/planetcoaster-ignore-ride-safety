@@ -12,7 +12,7 @@ local pcall = global.pcall
 local ipairs = global.ipairs
 local IgnoreRideSafety = module(...)
 
-IgnoreRideSafety.sVersion = "0.2.0-exp.5 EXPERIMENTAL"
+IgnoreRideSafety.sVersion = "0.2.0-exp.6 EXPERIMENTAL"
 
 -- Status codes returned by the native helper (see native/irs_patch.c)
 IgnoreRideSafety.ST_ON = 1
@@ -46,7 +46,7 @@ IgnoreRideSafety.tExperimental = {
   sEnable = "irs_exp_enable", sDisable = "irs_exp_disable", sStatus = "irs_exp_status",
   sID = "game.irsexperimentalopen",
   sLabel = "EXPERIMENTAL: allow opening untested or unfinished rides",
-  sToolTip = "Experimental. Lets untested or unfinished rides be opened; while such a ride is open, guests treat it as Excitement 8, Fear 8, Nausea 4. The ride may still close after a crash. Untick to restore normal behaviour. Resets to off when a park is loaded."
+  sToolTip = "Experimental. Lets untested or unfinished rides be opened; while such a ride is open, guests treat it as Excitement 8, Fear 8, Nausea 4, and it stays open after a crash. Untick to restore normal behaviour. Resets to off when a park is loaded."
 }
 IgnoreRideSafety.tExperimentalChannel = {"irs_exp_begin", "irs_exp_bit0", "irs_exp_bit1", "irs_exp_push", "irs_exp_commit", "irs_exp_report"}
 
