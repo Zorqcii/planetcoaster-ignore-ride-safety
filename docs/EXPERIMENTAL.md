@@ -8,7 +8,7 @@ Let guests board and ride incomplete or untested roller coasters, without changi
 
 ## Milestones
 1. The native helper gets reliable information about which rides are untested. **Done (0.2.0-exp.1), see results below.**
-2. Find out whether guests can board an untested or incomplete ride, and whether it dispatches with them. **Stage 0.2.0-exp.2 (current).**
+2. Find out whether guests can board an untested or incomplete ride, and whether it dispatches with them. **Stage 0.2.0-exp.3 (current).**
 3. Operation after a crash. Investigated separately, only after milestone 2.
 
 ## Earlier findings (from the pre-release experiment), re-checked
@@ -54,3 +54,19 @@ Both packages use the same folder name, so only one version and one DLL can be l
   Destinations not on the list (shops, rated rides) are never affected.
 * Disabling first stops handing out copies and clears the list, then restores the code.
 * Question: do guests now queue and board, and does the train dispatch with riders? Closing after a crash is still expected (milestone 3).
+
+## Stage 2 result (0.2.0-exp.2, manual test 2026-10-03)
+* Log: the ride was listed while open and guests got the assumed ratings ("guests now see assumed ratings for a listed ride").
+* Guests showed the thought "I want to go on Black Falcon 1" and walked to it. **The destination choice now works.**
+* With the train held at the station (600 s minimum wait), every guest **turned around at the entrance**, and "not until it's been tested" thoughts rose.
+  The ride closed itself after the empty train crashed.
+
+## Stage 3 (0.2.0-exp.3): the entrance check
+* Two more guest functions test the same "rated" bits: `0x1406a2990` and `0x1406a3470`, both called from `0x1406a6d90`.
+  They are the "can I join this ride now?" checks and record thought 0x2B on failure.
+  They take the assessment record as their 5th argument, read only non-rating fields after the test, and do not keep the pointer.
+* Their flag reads straddle 8-byte boundaries, so they cannot be patched atomically. Both functions start on aligned addresses, so the
+  hook is at the function entry instead (`jmp` to a wrapper; 6 and 5 bytes). The wrapper replaces the 5th argument with a per-thread copy
+  that has the rated bits set (listed rides only), then runs the original prologue bytes from a trampoline and continues in the function.
+* The four experimental sites and eight fingerprints are checked before applying. All-or-nothing with rollback.
+* Question: do guests now pass the entrance, queue, board, and dispatch with the train?

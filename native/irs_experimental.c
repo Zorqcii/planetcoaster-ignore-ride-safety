@@ -43,12 +43,20 @@ int _fltused = 0;
 #define EXP_ASSUMED_PRESTIGE 300.0f
 
 /* ---- patch sites ------------------------------------------------------------------------- */
-static struct site g_exp_sites[] = {
-    {0x14053812eULL, 2, {0x74, 0x0c}, {0x66, 0x90}},                    /* open gate: je -> nop */
-    {0x1406a051bULL, 5, {0x41, 0x8b, 0x44, 0x24}, {0}},                  /* evaluator flags read (5th byte below) */
+/* Each site lies within one aligned 8-byte word. Patch bytes of sites 1..3 are computed at runtime
+ * (they jump/call into the stub page). */
+struct xsite { uint64_t va; int n; uint8_t orig[8]; uint8_t patch[8]; };
+static struct xsite g_exp_sites[] = {
+    /* 0: open gate: je -> 2-byte nop */
+    {0x14053812eULL, 2, {0x74, 0x0c}, {0x66, 0x90}},
+    /* 1: evaluator: mov eax,[r12+0x64] -> call stub0 (exp_observe) */
+    {0x1406a051bULL, 5, {0x41, 0x8b, 0x44, 0x24, 0x64}, {0}},
+    /* 2: join check A entry (0x1406a2990): push rbp(40 55) ; push rsi ; push rdi ; push r14(41 56) -> jmp stub1 ; nop */
+    {0x1406a2990ULL, 6, {0x40, 0x55, 0x56, 0x57, 0x41, 0x56}, {0}},
+    /* 3: join check B entry (0x1406a3470): mov [rsp+0x20],r9 -> jmp stub2 */
+    {0x1406a3470ULL, 5, {0x4c, 0x89, 0x4c, 0x24, 0x20}, {0}},
 };
-static const uint8_t g_exp_site1_orig[5] = {0x41, 0x8b, 0x44, 0x24, 0x64}; /* mov eax,[r12+0x64] */
-static uint8_t g_exp_site1_patch[5];                                      /* call <stub>, filled at runtime */
+#define EXP_NSITES 4
 
 static const struct fp g_exp_fps[] = {
     /* open gate: mov ecx,[rdi+0xc] ; test al,al ; jne ; test ecx,ecx ; (je) ; mov eax,[rdi+0x10] */
@@ -59,6 +67,13 @@ static const struct fp g_exp_fps[] = {
                           0x49, 0x8b, 0x34, 0x24}},
     /* (mov eax,[r12+0x64]) ; and eax,0xd ; cmp al,0xd */
     {0x1406a0520ULL, 5, {0x83, 0xe0, 0x0d, 0x3c, 0x0d}},
+    /* join check A: (prologue) push r15 ; lea rbp,[rsp-0x27] ; sub rsp,0xd0 ... record = [rbp+0x77] (5th arg) */
+    {0x1406a2996ULL, 10, {0x41, 0x57, 0x48, 0x8d, 0x6c, 0x24, 0xd9, 0x48, 0x81, 0xec}},
+    {0x1406a29dbULL, 13, {0x4c, 0x8b, 0x65, 0x77, 0x41, 0x8b, 0x44, 0x24, 0x64, 0x83, 0xe0, 0x0d, 0x3c}},
+    /* join check B: (prologue) push rbp ; push rbx ; push rsi ; push rdi ; push r14 ; push r15 ; lea rbp,[rsp-0x208] */
+    {0x1406a3475ULL, 11, {0x55, 0x53, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xac}},
+    /* join check B: mov rax,[rbp+0x260] ; mov eax,[rax+0x64] ; and eax,0xd ; cmp al,0xd  (record = 5th arg) */
+    {0x1406a35b2ULL, 15, {0x48, 0x8b, 0x85, 0x60, 0x02, 0x00, 0x00, 0x8b, 0x40, 0x64, 0x83, 0xe0, 0x0d, 0x3c, 0x0d}},
 };
 
 static int g_exp_supported = -1;
@@ -72,8 +87,11 @@ static int exp_supported(void)
     if (!build_supported()) return 0;
     for (unsigned i = 0; i < sizeof g_exp_fps / sizeof g_exp_fps[0]; i++)
         if (!mem_eq((const uint8_t *)(uintptr_t)g_exp_fps[i].va, g_exp_fps[i].bytes, g_exp_fps[i].n)) return 0;
-    if (!mem_eq((const uint8_t *)(uintptr_t)g_exp_sites[0].va, g_exp_sites[0].orig, 2)) return 0;
-    if (!mem_eq((const uint8_t *)(uintptr_t)g_exp_sites[1].va, g_exp_site1_orig, 5)) return 0;
+    for (int i = 0; i < EXP_NSITES; i++) {
+        const struct xsite *x = &g_exp_sites[i];
+        if ((x->va & 7) + (uint64_t)x->n > 8) return 0;
+        if (!mem_eq((const uint8_t *)(uintptr_t)x->va, x->orig, x->n)) return 0;
+    }
     g_exp_supported = 1;
     return 1;
 }
@@ -92,6 +110,7 @@ static uint64_t g_exp_active[EXP_MAX_IDS];   /* copy for logging/matching on the
 static int g_exp_nactive;
 static DWORD g_exp_tls = 0xffffffffu;
 static volatile long g_exp_shadow_logged;
+static volatile long g_exp_join_logged;
 
 static int exp_listed(uint64_t id)
 {
@@ -202,36 +221,133 @@ __asm__(
     "    ret\n"
     ".att_syntax prefix\n");
 
-/* Allocate the stub page within +-2 GB of the evaluator and compute the call bytes. */
+/* ---- join checks (guest at the ride entrance) --------------------------------------------- */
+/* Called by the join wrappers with the 5th argument (guest assessment record) of 0x1406a2990 /
+ * 0x1406a3470. For an unrated record of a listed (open, untested) ride, returns a per-thread copy
+ * with the rated bits set; otherwise 0. These functions only test the rated bits and read
+ * non-rating fields (+0x08, +0x4c, +0x50, +0x5d), and do not keep the pointer. */
+void *exp_join_record(const uint8_t *rec)
+{
+    if (!g_exp_state || !rec || g_exp_tls == 0xffffffffu) return 0;
+    uint32_t flags = *(const uint32_t *)(rec + 0x64);
+    if ((flags & 0xd) == 0xd) return 0;
+    uint64_t id = *(const uint64_t *)rec;
+    if (!exp_listed(id)) return 0;
+    uint8_t *buf = (uint8_t *)TlsGetValue(g_exp_tls);
+    if (!buf) {
+        buf = (uint8_t *)HeapAlloc(GetProcessHeap(), 0, 0x100);
+        if (!buf) return 0;
+        TlsSetValue(g_exp_tls, buf);
+    }
+    uint8_t *copy = buf + 0x80;      /* separate from the evaluator's copy at buf+0 */
+    for (int i = 0; i < 0x80; i++) copy[i] = rec[i];
+    *(uint32_t *)(copy + 0x64) = flags | 0xd;
+    if (!g_exp_join_logged) {
+        g_exp_join_logged = 1;
+        log_line("experimental: guests now pass the entrance check for a listed ride");
+    }
+    return copy;
+}
+
+/* Wrapper entered by `jmp` from the patched function entry, so the stack is exactly as on entry:
+ * [rsp] = return address, [rsp+0x28] = 5th argument. Preserves rcx, rdx, r8, r9 and xmm0-xmm3
+ * (the argument registers); uses only rax and r11 (volatile, not arguments). Ends by jumping to
+ * the trampoline that runs the original prologue bytes and continues in the game function. */
+#define EXP_JOIN_WRAPPER(name, tramp) \
+    __asm__(".intel_syntax noprefix\n.text\n.globl " #name "\n" #name ":\n" \
+            "    mov rax, qword ptr [rsp+0x28]\n" \
+            "    test rax, rax\n" \
+            "    jz 1f\n" \
+            "    push rcx\n    push rdx\n    push r8\n    push r9\n" \
+            "    sub rsp, 0x68\n" \
+            "    movdqu xmmword ptr [rsp+0x20], xmm0\n    movdqu xmmword ptr [rsp+0x30], xmm1\n" \
+            "    movdqu xmmword ptr [rsp+0x40], xmm2\n    movdqu xmmword ptr [rsp+0x50], xmm3\n" \
+            "    mov rcx, rax\n" \
+            "    call exp_join_record\n" \
+            "    movdqu xmm0, xmmword ptr [rsp+0x20]\n    movdqu xmm1, xmmword ptr [rsp+0x30]\n" \
+            "    movdqu xmm2, xmmword ptr [rsp+0x40]\n    movdqu xmm3, xmmword ptr [rsp+0x50]\n" \
+            "    add rsp, 0x68\n" \
+            "    pop r9\n    pop r8\n    pop rdx\n    pop rcx\n" \
+            "    test rax, rax\n" \
+            "    jz 1f\n" \
+            "    mov qword ptr [rsp+0x28], rax\n" \
+            "1:\n" \
+            "    jmp qword ptr [rip + " #tramp "]\n" \
+            ".att_syntax prefix\n")
+void *g_exp_join_tramp_a;   /* address of trampoline A (original prologue + jump back) */
+void *g_exp_join_tramp_b;
+void exp_join_a(void);
+void exp_join_b(void);
+EXP_JOIN_WRAPPER(exp_join_a, g_exp_join_tramp_a);
+EXP_JOIN_WRAPPER(exp_join_b, g_exp_join_tramp_b);
+
+/* Writes `jmp qword ptr [rip+0] ; dq target` at p (14 bytes). */
+static void put_abs_jmp(uint8_t *p, uint64_t target)
+{
+    p[0] = 0xff; p[1] = 0x25; p[2] = p[3] = p[4] = p[5] = 0;
+    for (int i = 0; i < 8; i++) p[6 + i] = (uint8_t)(target >> (8 * i));
+}
+
+/* rel32 from (site + 5) to target, or 0 with *ok = 0 if out of range */
+static uint32_t rel32(uint64_t site, uint64_t target, int *ok)
+{
+    int64_t r = (int64_t)target - (int64_t)(site + 5);
+    if (r > 0x7fffffffLL || r < -0x80000000LL) { *ok = 0; return 0; }
+    return (uint32_t)r;
+}
+
+/* Allocate the stub page within +-2 GB of the game code and compute the patch bytes.
+ * Layout: +0x00 stub0 -> exp_observe ; +0x20 stub1 -> exp_join_a ; +0x40 stub2 -> exp_join_b ;
+ *         +0x60 trampoline A: original 6 prologue bytes of 0x1406a2990, then jmp 0x1406a2996 ;
+ *         +0x80 trampoline B: original 5 prologue bytes of 0x1406a3470, then jmp 0x1406a3475. */
 static int exp_prepare_stub(void)
 {
     if (g_exp_stub) return 1;
-    const uint64_t site = 0x1406a051bULL;
-    for (uint64_t a = 0x147800000ULL; a < 0x1c0000000ULL && !g_exp_stub; a += 0x10000)
-        g_exp_stub = (uint8_t *)VirtualAlloc((void *)(uintptr_t)a, 0x1000, 0x3000, PAGE_EXECUTE_READWRITE);
-    for (uint64_t a = 0x13f000000ULL; a > 0xc8000000ULL && !g_exp_stub; a -= 0x10000)
-        g_exp_stub = (uint8_t *)VirtualAlloc((void *)(uintptr_t)a, 0x1000, 0x3000, PAGE_EXECUTE_READWRITE);
-    if (!g_exp_stub) { log_line("experimental: could not allocate stub near the game image"); return 0; }
-    int64_t rel = (int64_t)(uintptr_t)g_exp_stub - (int64_t)(site + 5);
-    if (rel > 0x7fffffffLL || rel < -0x80000000LL) { log_line("experimental: stub out of range"); g_exp_stub = 0; return 0; }
-    uint64_t target = (uint64_t)(uintptr_t)&exp_observe;
-    g_exp_stub[0] = 0xff; g_exp_stub[1] = 0x25; g_exp_stub[2] = g_exp_stub[3] = g_exp_stub[4] = g_exp_stub[5] = 0;
-    for (int i = 0; i < 8; i++) g_exp_stub[6 + i] = (uint8_t)(target >> (8 * i));
-    FlushInstructionCache(GetCurrentProcess(), g_exp_stub, 16);
-    g_exp_site1_patch[0] = 0xe8;
-    for (int i = 0; i < 4; i++) g_exp_site1_patch[1 + i] = (uint8_t)((uint64_t)rel >> (8 * i));
+    uint8_t *page = 0;
+    for (uint64_t a = 0x147800000ULL; a < 0x1c0000000ULL && !page; a += 0x10000)
+        page = (uint8_t *)VirtualAlloc((void *)(uintptr_t)a, 0x1000, 0x3000, PAGE_EXECUTE_READWRITE);
+    for (uint64_t a = 0x13f000000ULL; a > 0xc8000000ULL && !page; a -= 0x10000)
+        page = (uint8_t *)VirtualAlloc((void *)(uintptr_t)a, 0x1000, 0x3000, PAGE_EXECUTE_READWRITE);
+    if (!page) { log_line("experimental: could not allocate stub near the game image"); return 0; }
+    put_abs_jmp(page + 0x00, (uint64_t)(uintptr_t)&exp_observe);
+    put_abs_jmp(page + 0x20, (uint64_t)(uintptr_t)&exp_join_a);
+    put_abs_jmp(page + 0x40, (uint64_t)(uintptr_t)&exp_join_b);
+    for (int i = 0; i < 6; i++) page[0x60 + i] = g_exp_sites[2].orig[i];
+    put_abs_jmp(page + 0x66, 0x1406a2996ULL);
+    for (int i = 0; i < 5; i++) page[0x80 + i] = g_exp_sites[3].orig[i];
+    put_abs_jmp(page + 0x85, 0x1406a3475ULL);
+    FlushInstructionCache(GetCurrentProcess(), page, 0xa0);
+    int ok = 1;
+    uint32_t r;
+    r = rel32(g_exp_sites[1].va, (uint64_t)(uintptr_t)(page + 0x00), &ok);   /* call stub0 */
+    g_exp_sites[1].patch[0] = 0xe8;
+    for (int i = 0; i < 4; i++) g_exp_sites[1].patch[1 + i] = (uint8_t)(r >> (8 * i));
+    r = rel32(g_exp_sites[2].va, (uint64_t)(uintptr_t)(page + 0x20), &ok);   /* jmp stub1 ; nop */
+    g_exp_sites[2].patch[0] = 0xe9;
+    for (int i = 0; i < 4; i++) g_exp_sites[2].patch[1 + i] = (uint8_t)(r >> (8 * i));
+    g_exp_sites[2].patch[5] = 0x90;
+    r = rel32(g_exp_sites[3].va, (uint64_t)(uintptr_t)(page + 0x40), &ok);   /* jmp stub2 */
+    g_exp_sites[3].patch[0] = 0xe9;
+    for (int i = 0; i < 4; i++) g_exp_sites[3].patch[1 + i] = (uint8_t)(r >> (8 * i));
+    if (!ok) { log_line("experimental: stub out of range"); return 0; }
+    g_exp_join_tramp_a = page + 0x60;
+    g_exp_join_tramp_b = page + 0x80;
+    g_exp_stub = page;
     return 1;
 }
 
 /* 0 off, 1 on, -1 mixed/unknown */
 static int exp_code_state(void)
 {
-    const uint8_t *p0 = (const uint8_t *)(uintptr_t)g_exp_sites[0].va;
-    const uint8_t *p1 = (const uint8_t *)(uintptr_t)g_exp_sites[1].va;
-    int off0 = mem_eq(p0, g_exp_sites[0].orig, 2), on0 = mem_eq(p0, g_exp_sites[0].patch, 2);
-    int off1 = mem_eq(p1, g_exp_site1_orig, 5), on1 = g_exp_stub && mem_eq(p1, g_exp_site1_patch, 5);
-    if (off0 && off1) return 0;
-    if (on0 && on1) return 1;
+    int off = 0, on = 0;
+    for (int i = 0; i < EXP_NSITES; i++) {
+        const struct xsite *x = &g_exp_sites[i];
+        const uint8_t *p = (const uint8_t *)(uintptr_t)x->va;
+        if (mem_eq(p, x->orig, x->n)) off++;
+        else if (g_exp_stub && mem_eq(p, x->patch, x->n)) on++;
+    }
+    if (off == EXP_NSITES) return 0;
+    if (on == EXP_NSITES) return 1;
     return -1;
 }
 
@@ -246,23 +362,24 @@ static int exp_set(int on)
         __sync_synchronize();
     }
     int cur = exp_code_state();
-    if (cur == on) return on ? ST_ON : ST_OFF;
+    if (cur == on) { g_exp_state = on; return on ? ST_ON : ST_OFF; }
     if (cur < 0) { log_line("experimental: code in an unexpected state - not changed"); return ST_RACE; }
-    const uint8_t *from[2] = {on ? g_exp_sites[0].orig : g_exp_sites[0].patch, on ? g_exp_site1_orig : g_exp_site1_patch};
-    const uint8_t *to[2] = {on ? g_exp_sites[0].patch : g_exp_sites[0].orig, on ? g_exp_site1_patch : g_exp_site1_orig};
-    const int n[2] = {2, 5};
     int done = 0, err = 0;
-    for (; done < 2; done++) {
-        int r = swap_bytes(g_exp_sites[done].va, n[done], from[done], to[done]);
+    for (; done < EXP_NSITES; done++) {
+        const struct xsite *x = &g_exp_sites[done];
+        int r = swap_bytes(x->va, x->n, on ? x->orig : x->patch, on ? x->patch : x->orig);
         if (r != 1) { err = r < 0 ? ST_PROTECT_FAIL : ST_RACE; break; }
     }
     if (err) {
-        for (int i = done - 1; i >= 0; i--) swap_bytes(g_exp_sites[i].va, n[i], to[i], from[i]);
+        for (int i = done - 1; i >= 0; i--) {
+            const struct xsite *x = &g_exp_sites[i];
+            swap_bytes(x->va, x->n, on ? x->patch : x->orig, on ? x->orig : x->patch);
+        }
         log_line("experimental: change failed and was rolled back");
         return err;
     }
     g_exp_state = on;
-    log_line(on ? "experimental: ON (untested/unfinished rides may open; listed open rides get assumed ratings for guests)"
+    log_line(on ? "experimental: ON (untested/unfinished rides may open; listed open rides are treated as rated by guests)"
                 : "experimental: OFF (original code restored)");
     return on ? ST_ON : ST_OFF;
 }
