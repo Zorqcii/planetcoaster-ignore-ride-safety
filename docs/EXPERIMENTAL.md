@@ -9,7 +9,7 @@ Let guests board and ride incomplete or untested roller coasters, without changi
 ## Milestones
 1. The native helper gets reliable information about which rides are untested. **Done (0.2.0-exp.1), see results below.**
 2. Find out whether guests can board an untested or incomplete ride, and whether it dispatches with them. **Done (0.2.0-exp.3).**
-3. Operation after a crash: the ride stays open and trains respawn for the next riders. **Stage 0.2.0-exp.5 (current).**
+3. Operation after a crash: the ride stays open and trains respawn for the next riders. **Done (0.2.0-exp.5).**
 4. (Later phase, owner request) Riders stay at the crash site and walk back, as in RollerCoaster Tycoon.
 
 ## Earlier findings (from the pre-release experiment), re-checked
@@ -98,3 +98,10 @@ Both packages use the same folder name, so only one version and one DLL can be l
   close and editors, runs the original code via a trampoline.
 * Lua now also sends the listed rides' **ride ids** (the crash handler identifies rides, not stations).
 * Question: does the ride stay open, and do trains respawn for the next riders (a continuous loop)?
+
+## Stage 5 result (0.2.0-exp.5, manual test 2026-10-03)
+* **The ride runs, crashes and stays open; the loop continues.** Owner report: "It works now. The ride runs, crashes, and stays open."
+* Log: list `221 219` (station id and ride id after this park load); "skipped the crash close of a listed ride" 6 + 6 + 6 times;
+  no other close requests for the listed ride.
+* Not yet separately confirmed: the player's own close button still closing the ride, disabling the option mid-loop, and the
+  stable-option regression checks with the experimental option off.
