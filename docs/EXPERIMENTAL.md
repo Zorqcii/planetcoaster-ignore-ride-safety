@@ -7,8 +7,8 @@ Branch `experimental/unfinished-rides`. Not part of any release. The stable rele
 Let guests board and ride incomplete or untested roller coasters, without changing the two stable options.
 
 ## Milestones
-1. The native helper gets reliable information about which rides are untested. **Stage 0.2.0-exp.1 (this build).**
-2. Find out whether guests can board an untested or incomplete ride, and whether it dispatches with them.
+1. The native helper gets reliable information about which rides are untested. **Done (0.2.0-exp.1), see results below.**
+2. Find out whether guests can board an untested or incomplete ride, and whether it dispatches with them. **Stage 0.2.0-exp.2 (current).**
 3. Operation after a crash. Investigated separately, only after milestone 2.
 
 ## Earlier findings (from the pre-release experiment), re-checked
@@ -39,3 +39,18 @@ whether an opened untested/unfinished ride dispatches, and whether any guest boa
 ## Local switching between stable and experimental
 `tools/dev/switch-install.sh PACKAGE.zip` (game closed) replaces `Win64/ovldata/IgnoreRideSafety` with the package's folder.
 Both packages use the same folder name, so only one version and one DLL can be loaded. `--status` shows what is installed.
+
+## Stage 1 result (0.2.0-exp.1, manual test 2026-10-03)
+* Lua sent the untested rides' station ids (`206 250`) to the helper. **The `bound=false` problem no longer applies.**
+* The guest code skipped destination `206` hundreds of times with all rating bits clear (`flags & 0xF == 0`), matching the Lua list
+  ("=ride from Lua"). **Guest destination id == station id: confirmed.**
+* As expected for an observe-only build, guests kept saying "not until it's been tested", and Black Falcon closed itself after crashing.
+
+## Stage 2 (0.2.0-exp.2)
+* Lua sends only rides that are **open and untested**.
+* For a destination on that list, the guest evaluator is given a private per-thread copy of the guest's assessment record with assumed
+  ratings (Excitement 8, Fear 8, Nausea 4, prestige 300) and the rated bits set (the values chosen by the project owner). The game's record
+  is never written. The evaluator's returned "chosen destination" still comes from the original record (`[rbp-0x40]`), so the copy cannot escape.
+  Destinations not on the list (shops, rated rides) are never affected.
+* Disabling first stops handing out copies and clears the list, then restores the code.
+* Question: do guests now queue and board, and does the train dispatch with riders? Closing after a crash is still expected (milestone 3).

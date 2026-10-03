@@ -3,9 +3,9 @@
 --  * Two independent options, toggled from Options > Game:
 --      fear   - guests ignore "ride too intense"
 --      nausea - guests ignore the nausea rating of a ride
---  * EXPERIMENTAL option (diagnostic stage): untested/unfinished rides may
---    be opened; the list of untested rides is sent to the native helper,
---    which records what the guest code sees. Off by default.
+--  * EXPERIMENTAL option (stage 2): untested/unfinished rides may be opened;
+--    the list of OPEN untested rides is sent to the native helper, which
+--    gives guests assumed ratings for exactly those rides. Off by default.
 --  * Everything is switched OFF when a park loads and when it is unloaded.
 --  * Per-frame work only while the experimental option is on.
 -----------------------------------------------------------------------
@@ -145,7 +145,7 @@ IgnoreRideSafetyManager.UpdateExperimental = function(self)
       local rideID = tW.rides:GetRideForStation(st)
       local bTested = tW.rides:IsTested(rideID) == true
       local nId = ToInteger(st)
-      if not bTested and nId ~= nil then
+      if not bTested and nId ~= nil and tW.attractions:IsOpen(st) then
         tIds[#tIds + 1] = nId
       end
       local sState = tW.attractions:IsOpen(st) and "open" or (tW.attractions:IsTesting(st) and "testing" or "closed")
@@ -179,7 +179,7 @@ IgnoreRideSafetyManager.UpdateExperimental = function(self)
   elseif self.bGuestIdMatch == nil and nReport == 2 then
     self.bGuestIdMatch = false
   end
-  tLines[#tLines + 1] = "Untested rides sent to helper: " .. #tIds .. ". Guest code skipping one of them seen: " ..
+  tLines[#tLines + 1] = "Open untested rides given assumed ratings: " .. #tIds .. ". Guest code reached one of them: " ..
     (self.bGuestIdMatch == true and "YES" or (self.bGuestIdMatch == false and "not yet" or "-"))
   self.tDiag = tLines
 end

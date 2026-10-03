@@ -4,7 +4,7 @@
  *
  * EXPERIMENTAL: unfinished / untested rides  (included at the end of irs_patch.c)
  *
- * Diagnostic stage 1 (0.2.0-exp.1). Nothing here is active unless the player ticks the
+ * Stage 2 (0.2.0-exp.2): guests see assumed ratings for listed rides (stage 1 was observe-only). Nothing here is active unless the player ticks the
  * experimental option; the stable fear/nausea options never depend on this file.
  *
  *  1) Open gate: the attraction "may open" test at 0x1405380f0 rejects attractions whose
@@ -15,15 +15,32 @@
  *     It sends their station ids through a one-way channel made only of distinct functions
  *     (begin / bit0 / bit1 / push / commit); no Lua state is read.
  *
- *  3) Observe-only guest hook: in the guest ride evaluator, `mov eax,[r12+0x64]` at 0x1406a051b
- *     (the read of the "destination has ratings" flags) is replaced by a call to exp_observe,
- *     which performs the same read and, when the destination is unrated, records its id. It never
- *     changes any register except eax (as the original instruction did) and never changes the
- *     game's decision. The recorded ids are written to the log, to confirm that the guest code's
- *     destination id is the same station id the Lua side reports, before any later stage relies on it.
+ *  3) Guest hook: in the guest ride evaluator, `mov eax,[r12+0x64]` at 0x1406a051b (the read of
+ *     the "destination has ratings" flags) is replaced by a call to exp_observe, which performs the
+ *     same read and, when the destination is unrated, records its id. Stage 1 confirmed in game that
+ *     this id is the station id the Lua side reports. If the id is on the list from Lua (open,
+ *     untested rides only), the evaluator is given a private per-thread COPY of the guest's
+ *     assessment record with assumed ratings (Excitement 8, Fear 8, Nausea 4, prestige 300) and the
+ *     rated bits set; r12 then points at the copy for the rest of that candidate's evaluation.
+ *     The game's record is never written. [rbp-0x40], from which the evaluator takes the chosen
+ *     destination it returns, still holds the original record, so the copy never escapes. Only eax
+ *     (as before) and, for listed rides, r12 are changed.
  */
 
 __declspec(dllimport) void *__stdcall VirtualAlloc(void *, uintptr_t, DWORD, DWORD);
+__declspec(dllimport) DWORD __stdcall TlsAlloc(void);
+__declspec(dllimport) void *__stdcall TlsGetValue(DWORD);
+__declspec(dllimport) BOOL __stdcall TlsSetValue(DWORD, void *);
+__declspec(dllimport) HANDLE __stdcall GetProcessHeap(void);
+__declspec(dllimport) void *__stdcall HeapAlloc(HANDLE, DWORD, uintptr_t);
+
+/* No C runtime: required symbol when floating point is used. */
+int _fltused = 0;
+
+#define EXP_ASSUMED_EXCITEMENT 8.0f
+#define EXP_ASSUMED_FEAR 8.0f
+#define EXP_ASSUMED_NAUSEA 4.0f
+#define EXP_ASSUMED_PRESTIGE 300.0f
 
 /* ---- patch sites ------------------------------------------------------------------------- */
 static struct site g_exp_sites[] = {
@@ -66,19 +83,33 @@ static int exp_supported(void)
 static uint64_t g_exp_acc;
 static uint64_t g_exp_pending[EXP_MAX_IDS];
 static int g_exp_npending;
-static uint64_t g_exp_active[EXP_MAX_IDS];
-static volatile int g_exp_nactive;
+/* active list, double-buffered: Lua (one thread) fills the inactive buffer, then flips g_exp_cur;
+ * guest threads read the current buffer. */
+static uint64_t g_exp_lists[2][EXP_MAX_IDS];
+static volatile int g_exp_counts[2];
+static volatile int g_exp_cur;
+static uint64_t g_exp_active[EXP_MAX_IDS];   /* copy for logging/matching on the Lua thread */
+static int g_exp_nactive;
+static DWORD g_exp_tls = 0xffffffffu;
+static volatile long g_exp_shadow_logged;
+
+static int exp_listed(uint64_t id)
+{
+    int cur = g_exp_cur;
+    __sync_synchronize();
+    int n = g_exp_counts[cur];
+    for (int i = 0; i < n && i < EXP_MAX_IDS; i++)
+        if (g_exp_lists[cur][i] == id) return 1;
+    return 0;
+}
 
 /* ---- observe-only record of unrated destinations seen by the guest code -------------------- */
 struct exp_seen { volatile uint64_t id; volatile uint32_t flags; volatile uint32_t count; };
 static struct exp_seen g_exp_seen[EXP_MAX_IDS];
 static volatile long g_exp_seen_overflow;
 
-void exp_observe_record(const uint8_t *rec)
+static void exp_record_seen(uint64_t id, uint32_t flags)
 {
-    uint64_t id = *(const uint64_t *)rec;
-    uint32_t flags = *(const uint32_t *)(rec + 0x64);
-    if (id == 0) return;
     unsigned h = (unsigned)(id * 0x9e3779b97f4a7c15ULL >> 58);       /* 0..63 */
     for (int probe = 0; probe < EXP_MAX_IDS; probe++) {
         struct exp_seen *e = &g_exp_seen[(h + probe) % EXP_MAX_IDS];
@@ -90,9 +121,39 @@ void exp_observe_record(const uint8_t *rec)
     g_exp_seen_overflow = 1;
 }
 
+/* Called from exp_observe for an unrated destination record; returns a shadow copy or 0. */
+void *exp_observe_record(const uint8_t *rec)
+{
+    uint64_t id = *(const uint64_t *)rec;
+    uint32_t flags = *(const uint32_t *)(rec + 0x64);
+    if (id == 0) return 0;
+    exp_record_seen(id, flags);
+    if (!g_exp_state || !exp_listed(id) || g_exp_tls == 0xffffffffu) return 0;
+    uint8_t *buf = (uint8_t *)TlsGetValue(g_exp_tls);
+    if (!buf) {
+        buf = (uint8_t *)HeapAlloc(GetProcessHeap(), 0, 0x100);
+        if (!buf) return 0;
+        TlsSetValue(g_exp_tls, buf);
+    }
+    for (int i = 0; i < 0x80; i++) buf[i] = rec[i];
+    uint32_t fl = *(uint32_t *)(buf + 0x64);
+    if (!(fl & 1)) {
+        *(float *)(buf + 0x40) = EXP_ASSUMED_EXCITEMENT;
+        *(float *)(buf + 0x44) = EXP_ASSUMED_FEAR;
+        *(float *)(buf + 0x48) = EXP_ASSUMED_NAUSEA;
+    }
+    if ((fl & 0xc) != 0xc) *(float *)(buf + 0x58) = EXP_ASSUMED_PRESTIGE;
+    *(uint32_t *)(buf + 0x64) = fl | 0xd;
+    if (!g_exp_shadow_logged) {
+        g_exp_shadow_logged = 1;
+        log_line("experimental: guests now see assumed ratings for a listed ride");
+    }
+    return buf;
+}
+
 /* exp_observe: replaces `mov eax,[r12+0x64]`. Performs that read; if the rated bits (0xD) are
- * not all set, records the destination. Preserves every register except eax/rax, like the
- * original instruction. Reached through a `jmp [rip+0]` stub, so no register is used to get here. */
+ * not all set, records the destination and, for listed rides, switches r12 to a shadow copy.
+ * Preserves every other register. Reached through a `jmp [rip+0]` stub (no register used). */
 void exp_observe(void);
 __asm__(
     ".intel_syntax noprefix\n"
@@ -131,6 +192,10 @@ __asm__(
     "    pop r8\n"
     "    pop rdx\n"
     "    pop rcx\n"
+    "    test rax, rax\n"
+    "    jz 2f\n"
+    "    mov r12, rax\n"
+    "2:\n"
     "    mov eax, dword ptr [r12+0x64]\n"
     "1:\n"
     "    pop r11\n"
@@ -174,6 +239,12 @@ static int exp_set(int on)
 {
     if (!exp_supported()) { log_line("experimental: unexpected game code - not applied"); return ST_UNSUPPORTED; }
     if (on && !exp_prepare_stub()) return ST_PROTECT_FAIL;
+    if (on && g_exp_tls == 0xffffffffu) g_exp_tls = TlsAlloc();
+    if (!on) {                       /* stop handing out copies before restoring the code */
+        g_exp_state = 0;
+        g_exp_counts[0] = g_exp_counts[1] = 0;
+        __sync_synchronize();
+    }
     int cur = exp_code_state();
     if (cur == on) return on ? ST_ON : ST_OFF;
     if (cur < 0) { log_line("experimental: code in an unexpected state - not changed"); return ST_RACE; }
@@ -191,7 +262,7 @@ static int exp_set(int on)
         return err;
     }
     g_exp_state = on;
-    log_line(on ? "experimental: ON (untested/unfinished rides may open; guest code observed, not changed)"
+    log_line(on ? "experimental: ON (untested/unfinished rides may open; listed open rides get assumed ratings for guests)"
                 : "experimental: OFF (original code restored)");
     return on ? ST_ON : ST_OFF;
 }
@@ -235,9 +306,14 @@ __declspec(dllexport) int irs_exp_commit(void *L)
     for (int i = 0; !changed && i < g_exp_npending; i++) changed = g_exp_pending[i] != g_exp_active[i];
     for (int i = 0; i < g_exp_npending; i++) g_exp_active[i] = g_exp_pending[i];
     g_exp_nactive = g_exp_npending;
+    int next = 1 - g_exp_cur;
+    for (int i = 0; i < g_exp_npending; i++) g_exp_lists[next][i] = g_exp_pending[i];
+    g_exp_counts[next] = g_exp_npending;
+    __sync_synchronize();
+    g_exp_cur = next;
     if (changed) {
         char buf[64 + EXP_MAX_IDS * 22], *p = buf;
-        p = fmt_str(p, "experimental: untested rides from Lua (station ids):");
+        p = fmt_str(p, "experimental: open untested rides from Lua (station ids):");
         for (int i = 0; i < g_exp_nactive; i++) { *p++ = ' '; p = fmt_u64(p, g_exp_active[i]); }
         *p = 0;
         log_line(buf);

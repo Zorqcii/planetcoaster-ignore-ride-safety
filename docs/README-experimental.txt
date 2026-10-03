@@ -7,11 +7,12 @@ For normal play use the stable release (0.1.0-beta):
 
 Contains the two stable options (unchanged) plus one EXPERIMENTAL option, off by default:
   "EXPERIMENTAL: allow opening untested or unfinished rides"
-In this build that option only:
-  * lets untested or unfinished rides be opened, and
-  * records what the guest code sees, in IgnoreRideSafety.log and in a diagnostics list
-    shown under the option in Options > Game.
-Guests are still expected to refuse untested rides in this build.
+In this build that option:
+  * lets untested or unfinished rides be opened,
+  * while such a ride is OPEN, makes guests treat it as Excitement 8 / Fear 8 / Nausea 4
+    (only those rides; the ride's own stats are not changed), and
+  * records what happens in IgnoreRideSafety.log and in a diagnostics list under the option.
+Known: an unfinished ride may still close itself after its train crashes (not addressed yet).
 
 Install with the game closed: replace Win64/ovldata/IgnoreRideSafety with the folder from this ZIP.
 Only one IgnoreRideSafety folder may exist. Use a COPY of a park for testing.

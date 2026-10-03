@@ -10,3 +10,8 @@ SetFilePointer
 WriteFile
 CloseHandle
 VirtualAlloc
+TlsAlloc
+TlsGetValue
+TlsSetValue
+GetProcessHeap
+HeapAlloc
