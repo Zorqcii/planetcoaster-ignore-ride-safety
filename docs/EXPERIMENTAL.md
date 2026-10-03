@@ -103,5 +103,5 @@ Both packages use the same folder name, so only one version and one DLL can be l
 * **The ride runs, crashes and stays open; the loop continues.** Owner report: "It works now. The ride runs, crashes, and stays open."
 * Log: list `221 219` (station id and ride id after this park load); "skipped the crash close of a listed ride" 6 + 6 + 6 times;
   no other close requests for the listed ride.
-* Not yet separately confirmed: the player's own close button still closing the ride, disabling the option mid-loop, and the
-  stable-option regression checks with the experimental option off.
+* Owner confirmed (2026-10-03): the ride's own close button still closes it; unticking the experimental option mid-loop returns the
+  ride to normal behaviour; with the experimental option off, the safety and nausea options behave exactly as in 0.1.0-beta.
