@@ -147,6 +147,11 @@ IgnoreRideSafetyManager.UpdateExperimental = function(self)
       local nId = ToInteger(st)
       if not bTested and nId ~= nil and tW.attractions:IsOpen(st) then
         tIds[#tIds + 1] = nId
+        -- the crash handler identifies the ride (not the station), so send the ride id too
+        local nRideId = ToInteger(rideID)
+        if nRideId ~= nil and nRideId ~= nId then
+          tIds[#tIds + 1] = nRideId
+        end
       end
       local sState = tW.attractions:IsOpen(st) and "open" or (tW.attractions:IsTesting(st) and "testing" or "closed")
       local nFree = "?"

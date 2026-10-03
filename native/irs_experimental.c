@@ -59,8 +59,10 @@ static struct xsite g_exp_sites[] = {
     {0x1405d40aaULL, 5, {0xe8, 0xc1, 0x30, 0xf6, 0xff}, {0}},
     /* 5: close-request function 0x140537510 entry: mov [rsp+0x18],rsi -> jmp stub4 (log only) */
     {0x140537510ULL, 5, {0x48, 0x89, 0x74, 0x24, 0x18}, {0}},
+    /* 6: close-all-stations-of-a-ride 0x140815460 entry: mov rax,rsp ; mov [rax+0x10],rbx -> jmp stub5 ; 2-byte nop */
+    {0x140815460ULL, 7, {0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10}, {0}},
 };
-#define EXP_NSITES 6
+#define EXP_NSITES 7
 
 static const struct fp g_exp_fps[] = {
     /* open gate: mov ecx,[rdi+0xc] ; test al,al ; jne ; test ecx,ecx ; (je) ; mov eax,[rdi+0x10] */
@@ -81,6 +83,11 @@ static const struct fp g_exp_fps[] = {
     {0x1405d40afULL, 4, {0x84, 0xc0, 0x75, 0x43}},
     /* close-request function: (mov [rsp+0x18],rsi) ; push rdi ; sub rsp,0x20 ; mov r8,[rdx] ; mov rdi,rcx */
     {0x140537515ULL, 11, {0x57, 0x48, 0x83, 0xec, 0x20, 0x4c, 0x8b, 0x02, 0x48, 0x8b, 0xf9}},
+    /* close-all-stations: (prologue) mov [rax+0x18],rbp ; mov [rax+0x20],rsi ; push rdi ; sub rsp,0x40 */
+    {0x140815467ULL, 13, {0x48, 0x89, 0x68, 0x18, 0x48, 0x89, 0x70, 0x20, 0x57, 0x48, 0x83, 0xec, 0x40}},
+    /* crash handler 0x1409a9270: mov rcx,[rdi+0x1e8] ; lea rdx,[rsp+0x40] ; mov [rsp+0x40],r10 ; call close-all ; jmp */
+    {0x1409a9335ULL, 24, {0x48, 0x8b, 0x8f, 0xe8, 0x01, 0x00, 0x00, 0x48, 0x8d, 0x54, 0x24, 0x40, 0x4c, 0x89, 0x54, 0x24,
+                          0x40, 0xe8, 0x15, 0xc1, 0xe6, 0xff, 0xeb, 0x2f}},
     /* join check B: mov rax,[rbp+0x260] ; mov eax,[rax+0x64] ; and eax,0xd ; cmp al,0xd  (record = 5th arg) */
     {0x1406a35b2ULL, 15, {0x48, 0x8b, 0x85, 0x60, 0x02, 0x00, 0x00, 0x8b, 0x40, 0x64, 0x83, 0xe0, 0x0d, 0x3c, 0x0d}},
 };
@@ -341,6 +348,43 @@ __asm__(".intel_syntax noprefix\n.text\n.globl exp_close_hook\nexp_close_hook:\n
         "    jmp qword ptr [rip + g_exp_close_tramp]\n"
         ".att_syntax prefix\n");
 
+/* ---- stage 5: the crash handler 0x1409a9270 closes every station of the ride through
+ * 0x140815460(system, &ride id). For calls returning to that handler (0x1409a934b) for a listed
+ * ride, the close is skipped (the routine returns at once; the handler does not use its result).
+ * All other callers, including the player's own close, are untouched. */
+#define EXP_CRASH_CLOSE_RETURN 0x1409a934bULL
+static volatile long g_exp_crashclose_skipped;
+
+int exp_skip_crash_close(uint64_t ride_id)
+{
+    if (g_exp_state && exp_listed(ride_id)) {
+        __sync_fetch_and_add(&g_exp_crashclose_skipped, 1);
+        return 1;
+    }
+    return 0;
+}
+
+void *g_exp_closeall_tramp;
+void exp_closeall_hook(void);
+__asm__(".intel_syntax noprefix\n.text\n.globl exp_closeall_hook\nexp_closeall_hook:\n"
+        "    mov rax, 0x1409a934b\n"
+        "    cmp qword ptr [rsp], rax\n"
+        "    jne 1f\n"
+        "    test rdx, rdx\n"
+        "    jz 1f\n"
+        "    push rcx\n    push rdx\n    push r8\n    push r9\n"
+        "    sub rsp, 0x28\n"
+        "    mov rcx, qword ptr [rdx]\n"
+        "    call exp_skip_crash_close\n"
+        "    add rsp, 0x28\n"
+        "    pop r9\n    pop r8\n    pop rdx\n    pop rcx\n"
+        "    test eax, eax\n"
+        "    jz 1f\n"
+        "    ret\n"
+        "1:\n"
+        "    jmp qword ptr [rip + g_exp_closeall_tramp]\n"
+        ".att_syntax prefix\n");
+
 /* Writes `jmp qword ptr [rip+0] ; dq target` at p (14 bytes). */
 static void put_abs_jmp(uint8_t *p, uint64_t target)
 {
@@ -361,7 +405,8 @@ static uint32_t rel32(uint64_t site, uint64_t target, int *ok)
  *         +0x60 trampoline A: original 6 prologue bytes of 0x1406a2990, then jmp 0x1406a2996 ;
  *         +0x80 trampoline B: original 5 prologue bytes of 0x1406a3470, then jmp 0x1406a3475 ;
  *         +0xa0 stub3 -> exp_isclosed ; +0xc0 stub4 -> exp_close_hook ;
- *         +0xe0 trampoline C: original 5 bytes of 0x140537510, then jmp 0x140537515. */
+ *         +0xe0 trampoline C: original 5 bytes of 0x140537510, then jmp 0x140537515 ;
+ *         +0x100 stub5 -> exp_closeall_hook ; +0x120 trampoline D: original 7 bytes of 0x140815460, then jmp 0x140815467. */
 static int exp_prepare_stub(void)
 {
     if (g_exp_stub) return 1;
@@ -382,7 +427,10 @@ static int exp_prepare_stub(void)
     put_abs_jmp(page + 0xc0, (uint64_t)(uintptr_t)&exp_close_hook);
     for (int i = 0; i < 5; i++) page[0xe0 + i] = g_exp_sites[5].orig[i];
     put_abs_jmp(page + 0xe5, 0x140537515ULL);
-    FlushInstructionCache(GetCurrentProcess(), page, 0x100);
+    put_abs_jmp(page + 0x100, (uint64_t)(uintptr_t)&exp_closeall_hook);
+    for (int i = 0; i < 7; i++) page[0x120 + i] = g_exp_sites[6].orig[i];
+    put_abs_jmp(page + 0x127, 0x140815467ULL);
+    FlushInstructionCache(GetCurrentProcess(), page, 0x140);
     int ok = 1;
     uint32_t r;
     r = rel32(g_exp_sites[1].va, (uint64_t)(uintptr_t)(page + 0x00), &ok);   /* call stub0 */
@@ -402,6 +450,11 @@ static int exp_prepare_stub(void)
     g_exp_sites[5].patch[0] = 0xe9;
     for (int i = 0; i < 4; i++) g_exp_sites[5].patch[1 + i] = (uint8_t)(r >> (8 * i));
     g_exp_close_tramp = page + 0xe0;
+    r = rel32(g_exp_sites[6].va, (uint64_t)(uintptr_t)(page + 0x100), &ok);  /* jmp stub5 ; 2-byte nop */
+    g_exp_sites[6].patch[0] = 0xe9;
+    for (int i = 0; i < 4; i++) g_exp_sites[6].patch[1 + i] = (uint8_t)(r >> (8 * i));
+    g_exp_sites[6].patch[5] = 0x66; g_exp_sites[6].patch[6] = 0x90;
+    g_exp_closeall_tramp = page + 0x120;
     if (!ok) { log_line("experimental: stub out of range"); return 0; }
     g_exp_join_tramp_a = page + 0x60;
     g_exp_join_tramp_b = page + 0x80;
@@ -534,6 +587,13 @@ __declspec(dllexport) int irs_exp_report(void *L)
     if (g_exp_seen_overflow) p = fmt_str(p, " [table full]");
     *p = 0;
     if (any) log_line(buf);
+    long skipped = __sync_lock_test_and_set(&g_exp_crashclose_skipped, 0);
+    if (skipped) {
+        char b1[96], *q = b1;
+        q = fmt_str(q, "experimental: skipped the crash close of a listed ride, times: ");
+        q = fmt_u64(q, (uint64_t)skipped); *q = 0;
+        log_line(b1);
+    }
     long kept = __sync_lock_test_and_set(&g_exp_keepopen_count, 0);
     if (kept) {
         char b2[96], *q = b2;

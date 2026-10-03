@@ -9,7 +9,7 @@ Let guests board and ride incomplete or untested roller coasters, without changi
 ## Milestones
 1. The native helper gets reliable information about which rides are untested. **Done (0.2.0-exp.1), see results below.**
 2. Find out whether guests can board an untested or incomplete ride, and whether it dispatches with them. **Done (0.2.0-exp.3).**
-3. Operation after a crash: the ride stays open and trains respawn for the next riders. **Stage 0.2.0-exp.4 (current).**
+3. Operation after a crash: the ride stays open and trains respawn for the next riders. **Stage 0.2.0-exp.5 (current).**
 4. (Later phase, owner request) Riders stay at the crash site and walk back, as in RollerCoaster Tycoon.
 
 ## Earlier findings (from the pre-release experiment), re-checked
@@ -84,3 +84,17 @@ Both packages use the same folder name, so only one version and one DLL can be l
 * Diagnostic, log only: the close-request function (`0x140537510`) is entered through a hook that records the calling address for
   listed rides. It never blocks a close, so the player can always close the ride. If the ride still closes, the log names the path.
 * Question: does the ride stay open and keep cycling (train respawns at the station, next riders board)?
+
+## Stage 4 result (0.2.0-exp.4, manual test 2026-10-03)
+* The ride still closed after the crash. The log showed the train-removed handler hook never fired; the only close request for the listed
+  ride came from `0x140815559`, i.e. from `0x140815460` ("close every station of a ride").
+* `0x140815460` has two callers: a Lua binding (`rides:CloseRide`, used only by UI/editor/DLC scripts) and the native crash handler
+  `0x1409a9270` (reached from `0x1409e0048`). That handler, under a lock, looks up the ride, checks `0x1408151c0`, adjusts a ride field,
+  and calls `0x140815460(system, &ride id)`; it does not use the result.
+
+## Stage 5 (0.2.0-exp.5): skip the crash close
+* Entry hook on `0x140815460` (7 bytes, aligned: `mov rax,rsp ; mov [rax+0x10],rbx` → `jmp ; nop`). If the call returns to the crash
+  handler (`0x1409a934b`) **and** the ride id is listed, the routine returns immediately. Every other call, including the player's own
+  close and editors, runs the original code via a trampoline.
+* Lua now also sends the listed rides' **ride ids** (the crash handler identifies rides, not stations).
+* Question: does the ride stay open, and do trains respawn for the next riders (a continuous loop)?
