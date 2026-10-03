@@ -1,0 +1,26 @@
+# build output
+build/
+dist/
+native/build/
+*.obj
+*.lib
+*.map
+# game data, logs, saves, local tooling (never commit)
+*.log
+*.ovl.bin
+*.lua.bin
+*.luac
+*.dmp
+saves/
+Saves/
+research/
+dumps/
+decompiled/
+.venv/
+__pycache__/
+*.pyc
+# credentials and local config
+.env
+*.pem
+*.key
+.DS_Store

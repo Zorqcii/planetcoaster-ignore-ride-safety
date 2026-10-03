@@ -1,0 +1,11 @@
+LIBRARY kernel32.dll
+EXPORTS
+VirtualProtect
+FlushInstructionCache
+GetCurrentProcess
+GetModuleHandleW
+GetModuleFileNameW
+CreateFileW
+SetFilePointer
+WriteFile
+CloseHandle
