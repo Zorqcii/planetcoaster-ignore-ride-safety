@@ -39,6 +39,7 @@ __declspec(dllimport) void *__stdcall HeapAlloc(HANDLE, DWORD, uintptr_t);
 /* diagnostic round 1 (irs_diag.c, included at the end) */
 static void dx_event(uint32_t kind, uint64_t ret, uint64_t a, uint64_t b, uint64_t c);
 static void dx_log_installed(void);
+static int pt_set(int on);
 void dx_hook_train(void);
 void dx_hook_purge(void);
 void dx_hook_physics(void);
@@ -541,6 +542,7 @@ static int exp_set(int on)
     if (!exp_supported()) { log_line("experimental: unexpected game code - not applied"); return ST_UNSUPPORTED; }
     if (on && !exp_prepare_stub()) return ST_PROTECT_FAIL;
     if (on && g_exp_tls == 0xffffffffu) g_exp_tls = TlsAlloc();
+    if (!on && g_exp_stub) pt_set(0); /* the prototype depends on the experimental code */
     if (!on) {                       /* stop handing out copies before restoring the code */
         g_exp_state = 0;
         g_exp_counts[0] = g_exp_counts[1] = 0;
@@ -677,3 +679,6 @@ __declspec(dllexport) int irs_exp_report(void *L)
 
 /* DIAGNOSTIC round 1: observation-only hooks (sites 7-9) and their report. */
 #include "irs_diag.c"
+
+/* PROTOTYPE: one-rider physics launch (separate option, off by default). */
+#include "irs_proto.c"

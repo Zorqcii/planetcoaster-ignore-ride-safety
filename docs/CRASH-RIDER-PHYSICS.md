@@ -153,6 +153,47 @@ No mechanism has been observed or identified that **safely transfers a detached 
    a passenger at the crash site.
 Per the round's rules this diagnostic round stops here. Next step only by owner decision.
 
+## Prototype 0.2.0-proto.1: one-rider physics launch (owner-approved, built, not yet tested)
+Package `IgnoreRideSafety-PROTOTYPE-0.2.0-proto.1.zip` (not published). It contains everything of 0.2.0-diag.1 plus a separate option,
+off by default and reset on park load: "PROTOTYPE (research): launch one crashed rider into guest physics". It works only while the
+experimental option is on; turning the experimental option off also removes the prototype hook. Crash-site positioning is out of scope.
+
+Sequence, at most one launch per crash and none while a launched rider is being watched (180 s):
+1. The purge hook counts a crash when the destroyed-vehicle listener purges riders (caller `0x14081bb0f`).
+2. Scripts, from 0.5 s to 10 s after the purge, check riders from the last list taken while riders were aboard. A rider qualifies only if:
+   * it still exists: `GetGuestGroupID` succeeds and the guest is in `GetGuestsInGroup` of that group;
+   * it has finished unloading: it is no longer in `GetGuestsOnRide`, and its group's `GetGroupDecisionState().sBehaviour` is
+     not OnRide, Queueing, Physics, Trapped or AtSecurityGuard;
+   * it is not leaving the park (Navigating without a via-target).
+   The first qualifying rider arms the helper.
+3. In the guest-physics update context: an entry hook on `0x14067de10` runs on that update's thread with its object, before
+   the update body. It checks:
+   * the arming is no more than 250 ms old;
+   * the same physics object has been seen for at least 60 ticks;
+   * the fields the start routine uses are present (`+0x198`, `+0x1a0`, `+0x1a8`, `+0x218`, non-empty maps);
+   * the guest is **not** already in the physics guest map (`+0x228`);
+   * the chosen group key is unused in the group map (`+0x248`).
+   The two lookups re-implement the game's hash and node layout read-only. They are checked against the game's own code in an emulator
+   (hash: 4000 random keys; full lookup: 400 queries on a test map; 0 mismatches) and covered by build checks on that code.
+   Only then does it call `0x14067d450(system, &guest, &{key, 0,0,0,0}, 0)`. Any failed check is logged as "NOT launched: <reason>".
+4. Logged after a launch:
+   * the start result and the incident counter before and after;
+   * when the guest leaves the physics guest map and when its group disappears (update thread, timestamped);
+   * the group's behaviour changes, the guest disappearing or reappearing, the trapped count, and `GuestPhysicsIncidentEnded`
+     messages (scripts).
+
+Known limits (stated before the test):
+* The guest checks are made by the scripts. The physics call happens on the next physics tick, at most 250 ms later. A guest could
+  in theory change state in between.
+* Group behaviour is per group, not per guest.
+* The start routine has never been seen running. Calling it from the update entry, rather than from the game's own (protected) caller,
+  may break assumptions about thread, locks or timing. The group key's meaning is unknown (a fresh key is used). The four motion
+  values are zero.
+* The 5-second timer is what the start routine sets. Whether the guest actually recovers after it is **unproven**; the log is meant
+  to show it.
+* Possible failures: game crash; guest stuck, frozen, invisible or permanently trapped; physics body never removed.
+  Recovery: untick the prototype option; on any problem quit without saving and switch back to 0.2.0-exp.6.
+
 ## Earlier proposal (superseded by the plan above)
 An **observe-only** helper build: log-only entry hooks on the purge routine `0x14081a0a0`, the train-removed handler `0x1405d3fb0` and the start
 routine `0x14067d450`, each recording its return address. During one crash on a copied park it would show which of them runs, which code moves

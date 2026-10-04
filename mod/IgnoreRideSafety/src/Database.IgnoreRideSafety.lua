@@ -12,11 +12,13 @@ local pcall = global.pcall
 local ipairs = global.ipairs
 local IgnoreRideSafety = module(...)
 
-IgnoreRideSafety.sVersion = "0.2.0-diag.1 DIAGNOSTIC"
+IgnoreRideSafety.sVersion = "0.2.0-proto.1 PROTOTYPE"
 -- Package and component versions (shown separately in the options header and the log).
-IgnoreRideSafety.sPackageVersion = "0.2.0-diag.1"
-IgnoreRideSafety.sScriptsVersion = "0.2.0-diag.1"
-IgnoreRideSafety.nExpectedHelperDiagBuild = 1
+IgnoreRideSafety.sPackageVersion = "0.2.0-proto.1"
+IgnoreRideSafety.sScriptsVersion = "0.2.0-proto.1"
+IgnoreRideSafety.sPackageLabel = "PROTOTYPE"
+IgnoreRideSafety.nExpectedHelperDiagBuild = 2
+IgnoreRideSafety.tHelperBuildNames = {[1] = "0.2.0-diag.1", [2] = "0.2.0-proto.1"}
 
 -- Status codes returned by the native helper (see native/irs_patch.c)
 IgnoreRideSafety.ST_ON = 1
@@ -55,6 +57,14 @@ IgnoreRideSafety.tExperimental = {
 IgnoreRideSafety.tExperimentalChannel = {"irs_exp_begin", "irs_exp_bit0", "irs_exp_bit1", "irs_exp_push", "irs_exp_commit", "irs_exp_report"}
 -- DIAGNOSTIC (observation only): optional; absent from non-diagnostic helpers.
 IgnoreRideSafety.tDiagnosticNames = {"irs_dx_build", "irs_dx_riders_commit", "irs_dx_report"}
+-- PROTOTYPE option (research): launch one crashed rider into guest physics. Off by default; needs the experimental option.
+IgnoreRideSafety.tPrototype = {
+  sEnable = "irs_pt_enable", sDisable = "irs_pt_disable", sStatus = "irs_pt_status",
+  sID = "game.irsprototypelaunch",
+  sLabel = "PROTOTYPE (research): launch one crashed rider into guest physics",
+  sToolTip = "Research only, use a copied park. Needs the EXPERIMENTAL option. After a crash, one rider who has finished unloading is launched into the game's guest physics at the exit (no position or speed is set); launch and recovery are logged. Untick to stop. Resets to off when a park is loaded."
+}
+IgnoreRideSafety.tPrototypeNames = {"irs_pt_enable", "irs_pt_disable", "irs_pt_status", "irs_pt_poll", "irs_pt_arm", "irs_pt_result", "irs_pt_note"}
 
 -- "package X (scripts Y, helper Z)" so a mixed installation is visible.
 function IgnoreRideSafety.GetVersionText()
@@ -62,14 +72,15 @@ function IgnoreRideSafety.GetVersionText()
   local sHelper
   if t == nil then
     sHelper = "helper not loaded"
-  elseif t.nHelperDiagBuild == IgnoreRideSafety.nExpectedHelperDiagBuild then
-    sHelper = "helper diag." .. tostring(t.nHelperDiagBuild)
   elseif t.nHelperDiagBuild ~= nil then
-    sHelper = "helper diag." .. tostring(t.nHelperDiagBuild) .. " MISMATCH"
+    sHelper = "helper " .. tostring(IgnoreRideSafety.tHelperBuildNames[t.nHelperDiagBuild] or ("build " .. tostring(t.nHelperDiagBuild)))
+    if t.nHelperDiagBuild ~= IgnoreRideSafety.nExpectedHelperDiagBuild then
+      sHelper = sHelper .. " MISMATCH"
+    end
   else
-    sHelper = "helper is NOT the diagnostic build"
+    sHelper = "helper is NOT a research build (MISMATCH)"
   end
-  return IgnoreRideSafety.sPackageVersion .. " DIAGNOSTIC (scripts " .. IgnoreRideSafety.sScriptsVersion .. ", " .. sHelper .. ")"
+  return IgnoreRideSafety.sPackageVersion .. " " .. IgnoreRideSafety.sPackageLabel .. " (scripts " .. IgnoreRideSafety.sScriptsVersion .. ", " .. sHelper .. ")"
 end
 
 local function GetDLLPath()
@@ -147,6 +158,16 @@ function IgnoreRideSafety.LoadNative()
     end
   end
   tNative.bDiagnostic = bDiag
+  local bProto = bDiag
+  for _, sName in ipairs(IgnoreRideSafety.tPrototypeNames) do
+    local fn = package.loadlib(sPath, sName)
+    if fn == nil then
+      bProto = false
+    else
+      tNative[sName] = fn
+    end
+  end
+  tNative.bPrototype = bProto
   tNative.nHelperDiagBuild = bDiag and Call(tNative.irs_dx_build) or nil
   IgnoreRideSafety.tNative = tNative
   return tNative
@@ -205,6 +226,7 @@ function IgnoreRideSafety.InstallOptionsHook()
       self.tIRSPending[sKind] = IgnoreRideSafety.IsEnabled(sKind)
     end
     self.tIRSPending.experimental = IgnoreRideSafety.IsEnabled("experimental")
+    self.tIRSPending.prototype = IgnoreRideSafety.IsEnabled("prototype")
     return r
   end
   GameOptionsMenu.GetItems = function(self, _tSettingsMenuItemsData, ...)
@@ -240,6 +262,18 @@ function IgnoreRideSafety.InstallOptionsHook()
           toggled = self.tIRSPending ~= nil and self.tIRSPending.experimental == true,
           enabled = bExpAvailable
         }
+        if m.tNative.bPrototype then
+          local tPt = IgnoreRideSafety.tPrototype
+          local bPtAvailable = bExpAvailable and m.tStatus.prototype ~= IgnoreRideSafety.ST_UNSUPPORTED
+          tItems[#tItems + 1] = {
+            id = tPt.sID,
+            label = UIText(tPt.sLabel),
+            toolTip = UIText(bPtAvailable and tPt.sToolTip or "Unavailable: prototype code checks failed; see IgnoreRideSafety.log"),
+            itemRendererClass = OptionsMenuGUI.CHECK_BOX,
+            toggled = self.tIRSPending ~= nil and self.tIRSPending.prototype == true,
+            enabled = bPtAvailable
+          }
+        end
         if m:IsEnabled("experimental") then
           for _, sLine in ipairs(m:GetDiagnosticLines()) do
             tItems[#tItems + 1] = {
@@ -266,6 +300,11 @@ function IgnoreRideSafety.InstallOptionsHook()
       self.tIRSPending.experimental = _arg == true
       return true
     end
+    if _sID == IgnoreRideSafety.tPrototype.sID then
+      self.tIRSPending = self.tIRSPending or {}
+      self.tIRSPending.prototype = _arg == true
+      return true
+    end
     if type(_sID) == "string" and string.sub(_sID, 1, 11) == "game.irsdia" then
       return true
     end
@@ -282,9 +321,17 @@ function IgnoreRideSafety.InstallOptionsHook()
         end
       end
       local bWantExp = self.tIRSPending.experimental
+      local bWantPt = self.tIRSPending.prototype
+      if bWantPt == false and m:IsEnabled("prototype") then
+        m:SetPrototype(false)
+      end
       if bWantExp ~= nil and bWantExp ~= m:IsEnabled("experimental") then
         m:SetExperimental(bWantExp)
       end
+      if bWantPt == true and not m:IsEnabled("prototype") then
+        m:SetPrototype(true)
+      end
+      self.tIRSPending.prototype = m:IsEnabled("prototype")
     end
     return r
   end

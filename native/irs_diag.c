@@ -18,7 +18,9 @@
 __declspec(dllimport) uint64_t __stdcall GetTickCount64(void);
 __declspec(dllimport) DWORD __stdcall GetCurrentThreadId(void);
 
-#define DX_BUILD 1                 /* returned by irs_dx_build: helper is diagnostic build 1 */
+#define DX_BUILD 2                 /* returned by irs_dx_build: 1 = 0.2.0-diag.1, 2 = 0.2.0-proto.1 */
+static volatile long g_pt_crashes;  /* crash purges seen (destroyed-vehicle listener); used by irs_proto.c */
+void pt_update(const uint64_t *r);
 enum { DX_CRASHCLOSE = 1, DX_TRAIN = 2, DX_PURGE = 3, DX_PHYSICS = 4, DX_KINDS = 5 };
 
 struct dx_ev {
@@ -100,6 +102,7 @@ void dx_purge(const uint64_t *r)
         if (data && n > 0) first = data[0];
         if (data && n > 1) second = data[1];
     }
+    if (r[4] == 0x14081bb14ULL) __sync_fetch_and_add(&g_pt_crashes, 1);
     dx_event(DX_PURGE, r[4], n, first, second);
 }
 
@@ -159,7 +162,9 @@ static const char *dx_caller_name(uint64_t ret)
     case 0x1405d78eeULL: return "caller 0x1405d7867";
     case 0x14408ee69ULL: return "protected decision code";
     case 0x1409a934bULL: return "crash handler";
-    default: return "other";
+    default:
+        if (ret >= (uint64_t)(uintptr_t)&pt_update && ret < (uint64_t)(uintptr_t)&pt_update + 0x1000) return "this mod's PROTOTYPE launch";
+        return "other";
     }
 }
 

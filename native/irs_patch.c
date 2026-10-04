@@ -67,8 +67,8 @@ __declspec(dllimport) DWORD __stdcall SetFilePointer(HANDLE, long, long *, DWORD
 __declspec(dllimport) BOOL __stdcall WriteFile(HANDLE, const void *, DWORD, DWORD *, void *);
 __declspec(dllimport) BOOL __stdcall CloseHandle(HANDLE);
 
-#define IRS_VERSION "0.2.0-diag.1 DIAGNOSTIC"
-#define IRS_PACKAGE "0.2.0-diag.1"
+#define IRS_VERSION "0.2.0-proto.1 PROTOTYPE"
+#define IRS_PACKAGE "0.2.0-proto.1"
 
 /* status codes returned to Lua */
 enum {
