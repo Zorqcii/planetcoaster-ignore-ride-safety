@@ -31,6 +31,75 @@ The approach is therefore **unresolved within the agreed scope, not disproven.**
 * the real group ID to pass;
 * the required group-state and recovery sequence.
 
+## Read-only research round 2 (2026-10-03, after closeout): group ID, entry and recovery sequence
+Static analysis only; no build, install or live test. exp.6 stays installed. The stop condition is unchanged.
+
+### Real group-ID source (established statically, high confidence)
+* `guests:GetGroupDecisionState(groupID)` (`0x1403fbc90`) reads the record at `[guest manager + 0x3b8] + groupID * 0x250`.
+  It names byte `+0x19` (sEndeavour) and byte `+0x1a` (sBehaviour) from string tables. In the sBehaviour table `0x0b` = **Physics**
+  and `0x0a` = Trapped; the full table is Idle 0, Navigating 1, Lost 2, Queueing 3, OnRide 4, Exiting 5, AtShop 6, AtBench 7, AtEntertainer 8,
+  Suspended 9, Trapped 0xa, Physics 0xb, AtSecurityGuard 0xc, ...
+* `guests:GetGuestGroupID(guest)` (`0x1403f90a0`) returns the guest's group index: guest map `+0x390` → guest record (`+0x3b0`, 0x30 bytes)
+  field `+0x28`. **The script group ID is the index into the 0x250-byte guest-group array.**
+* In the game's own data flow, the incident-group key is that same index:
+  * the per-tick physics update copies the incident group's key (`[node+0x10]`) into a message at `+0x18` (`0x14067ebd7`);
+  * the receiver `0x1406a8ed0` reads `+0x18` and indexes the guest-group array with it. This is the access the invented ID broke;
+  * the enter-Physics routine (below) stores the group index as the first field of the "GuestPhysics" component data, which has
+    the same 20-byte layout as the record the physics start routine reads. The start routine therefore receives
+    `{group index, 3-float vector, reason}`.
+* Not proven: the message-type registration that would formally pair the sender at `0x14067ebd7` with receiver `0x1406a8ed0` is in
+  the protected region. The pairing is inferred from the matching layout and from the crash.
+
+### Entry into physics (readable except one link)
+1. **Contact handler** `0x140589ea0`, called every tick from the world update (`0x1400b08c7`, next to the guest-physics update call
+   `0x1400b0899`):
+   * it filters physics contacts between the "Character" group and the "Flying" surface;
+   * for each contact it asks three source checks (`0x140591fb0`, `0x140592290`, `0x140592490`);
+   * if one accepts, it posts a per-guest **impact event**: `+0x18` guest id, `+0x20` vec3, `+0x2c` vec3, `+0x38` reason (default 1),
+     `+0x40` source id.
+2. **Receiver** `0x1406b58b0`:
+   * maps the guest to its group (map `+0x218`) and checks the per-group entry `[+0x288][group]`;
+   * then applies the **entry prerequisites** (below);
+   * skips groups that already have a request pending (map `+0x238`);
+   * posts a group request via `0x1406f0a00`: `+0x18` group index, `+0x1c` reason, `+0x20` vec3, `+0x2c` vec3, `+0x38` source id.
+3. **Receiver** `0x1406a8bc0` re-checks the same prerequisites, then calls the **enter-Physics routine** `0x14069c8a0(system, &group,
+   record, &vec3 at +0x2c, reason)`:
+   * it ends the current behaviour through `0x14069cec0`, which removes that behaviour's per-guest component;
+   * it gives the group a physics handle (`record+0x50`) if it has none;
+   * it adds a **"GuestPhysics" component to every group member** (members are guest indices `[record+0]`..`[record+4]`) with data
+     `{group index, vec3, reason}`;
+   * it writes `0x010b` to `record+0x1a` (behaviour = Physics, next byte = 1).
+4. **Protected link:** the reaction to the new "GuestPhysics" component that calls the start routine `0x14067d450` per guest. Its only
+   caller is the protected `0x14408ee20`, and the GuestPhysics manager's method table points into the protected region. That the
+   component data is what the start routine receives is inferred from the identical layout, not observed.
+
+**Entry prerequisites** (identical in both receivers):
+* group record `+8` ≠ 0 and `+9` ≠ 0 (meaning not identified);
+* current behaviour is one of **Navigating, AtShop, AtEntertainer, AtSecurityGuard** (bit mask `0x1142`). **OnRide, Queueing, Lost,
+  Idle and Exiting are not accepted.**
+* if reason = 2 and `record+0xd8` = 1, a further check `0x1406cdf90` must fail (meaning not identified);
+* the source id differs from a system value at `+0x9a50` (meaning not identified).
+
+### Leaving physics (readable)
+* Per tick, `0x14067de10` runs the incident timer (`+0x290`, 5.0 s). When it expires, it sends `GuestPhysicsIncidentEnded` (`0x14068043d`).
+* Per incident group, once a per-member count equals the member count, it posts the group message with the group index.
+  The per-member condition was not analysed in detail. A stranded-guest (SOS) path is at `0x140680af0`.
+* Receiver `0x1406a8ed0` requires behaviour = Physics (`0x0b`) and `record+8`/`+9`. It then calls `0x14069cec0`, which for Physics
+  **removes the "GuestPhysics" component from every member** (jump table: Physics → remove "GuestPhysics"; Trapped → remove "GuestSOS";
+  Lost → remove "GuestLost"). The next behaviour is chosen later by the group AI.
+* What removing the component tears down (rigid body, physics maps) is presumably the protected component handler's job. Not established.
+
+### What this means
+* The game's own design launches **guests on foot** (and whole groups) on contact, and recovers them **as a group**.
+  Riders are never in an accepted behaviour. After the purge, the prototype's rider's group showed Lost/Idle, which is also not
+  accepted, so the game's own path would have refused it.
+* The prototype bypassed all of this: it called the start routine directly without the group state, component or group-wide entry,
+  and with an invented ID. That explains the stuck guest as well as the crash, though the stuck guest is an inference.
+* **Boundary reached:** the one remaining link (GuestPhysics component added → start routine and teardown on removal) is in the
+  excluded protected code. Everything else in the entry and recovery sequence is identified statically, with the uncertainties listed.
+* No live test was done. A game-native observation would be possible without any mod change (e.g. watching whether guests on a path
+  that crash debris reaches are launched), but it is not planned.
+
 ## Diagnostics: what the zero counts do and do not show
 The 0.2.0-exp.6 crash observer counted `GuestPhysicsIncidentEnded` 0, `GuestHidden` 0 and trapped guests 0 over several crashes with riders aboard.
 **This is not proof that guest physics never occurs in these crashes:**
