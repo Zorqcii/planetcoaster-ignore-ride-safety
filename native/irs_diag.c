@@ -114,7 +114,7 @@ void dx_physics(const uint64_t *r)
 /* Entered by `jmp` from a hooked function entry (stack exactly as on entry). Saves the argument
  * registers and xmm0-xmm3, calls the C body with a pointer to the saved registers and the return
  * address, restores everything and jumps to the trampoline (original first bytes + jump back).
- * Uses rax and r11 only as scratch; neither carries an argument at a function entry. */
+ * The C body may change rax, r10, r11 and xmm4-xmm5: volatile registers that carry no argument at a function entry. */
 #define DX_ENTRY_WRAPPER(name, body, tramp) \
     __asm__(".intel_syntax noprefix\n.text\n.globl " #name "\n" #name ":\n" \
             "    push rcx\n    push rdx\n    push r8\n    push r9\n" \
