@@ -112,7 +112,34 @@ Static analysis only; no build, install or live test. exp.6 stays installed. The
 | Other entry paths (e.g. in protected code) | **Unknown** |
 Prototype status: **blocked** (owner decision, 2026-10-03). The stop condition is unchanged.
 
-### Proposed observation-only test of normal bystander physics (proposal only, not run)
+### Bystander observation, session 1 (2026-10-03, about 22:50–23:10): protocol deviations, partial result
+**Conditions:** these differed from the proposal, and the result is weighed accordingly.
+* The owner's **main park** was used, not a disposable copy. It was not saved: no save file changed after 21:50 apart from Steam's
+  `steam_autocloud.vdf` bookkeeping.
+* The mod log shows **"Ignore ride safety", "Ignore ride nausea" and EXPERIMENTAL all ticked** for the session, so the coaster ran
+  as an open untested ride with riders (the exp.6 crash loop), not as an empty test run. The exp.6 patch sites are the open gate, the
+  rating evaluator, the two join checks, the IsClosed call and two close routines. Statically, none of them is in the contact,
+  impact or physics code above. That is a static statement, not a verified one.
+* Only one helper session appears in the log; all options were switched off at shutdown.
+
+**Observed (owner report):**
+* Riders of the crashed train reappeared at the exit (known exp.6 behaviour).
+* **At least one bystander was hit by the crash and fell.** The owner identified the guest in the guest panel and read that guest's group
+  there: 3 other members. **Whether the other members also fell was not reported, so no whole-group claim is made.**
+* The guest **got up again** afterwards. **Recovery time was not measured**: the owner's estimate ("about 10 minutes ago, maybe") refers to
+  when they got up relative to the report, not to how long they were down.
+* Status line in the guest panel: **not recorded.** Stranded/trapped guests: **none reported.**
+* Internal messages: **no logged evidence.** exp.6's crash observer shows its counts only in the options menu, the game is now closed and
+  they were not read, so no claim is made that `GuestPhysicsIncidentEnded` or any other message fired.
+
+**What this establishes:** in this game build, crash debris can knock down a bystander on foot, and that guest later recovers on their own.
+This is consistent with the statically found contact → impact → enter-Physics → recovery path, but it **does not prove** that path was
+taken (no status line, no logging). Nothing here changes the "Unresolved" table. The prototype stays blocked.
+
+**Still open from the proposal:** the displayed status, group-wide behaviour (members checked), recovery duration, and any stranded guests.
+These would need a repeat under the original conditions: disposable copy, all options off, empty test run.
+
+### Proposed observation-only test of normal bystander physics (proposal; session 1 above ran with deviations)
 Purpose: watch the game's **own** crash-to-bystander physics once, with no new code, to check the statically found path against reality.
 * **Setup (disposable copy of a park):** an unfinished coaster whose open track end points over a busy footpath (debris lands among
   guests). The ride is **closed and in test mode**, which the base game allows and which crashes with no riders aboard. All mod options
