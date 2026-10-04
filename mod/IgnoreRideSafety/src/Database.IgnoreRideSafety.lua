@@ -12,7 +12,7 @@ local pcall = global.pcall
 local ipairs = global.ipairs
 local IgnoreRideSafety = module(...)
 
-IgnoreRideSafety.sVersion = "0.1.0-beta"
+IgnoreRideSafety.sVersion = "0.2.0-exp.6 EXPERIMENTAL"
 
 -- Status codes returned by the native helper (see native/irs_patch.c)
 IgnoreRideSafety.ST_ON = 1
@@ -40,6 +40,15 @@ IgnoreRideSafety.tOptions = {
   }
 }
 IgnoreRideSafety.tOptionOrder = {"fear", "nausea"}
+
+-- EXPERIMENTAL option (off by default, never part of tOptionOrder so the stable options never depend on it).
+IgnoreRideSafety.tExperimental = {
+  sEnable = "irs_exp_enable", sDisable = "irs_exp_disable", sStatus = "irs_exp_status",
+  sID = "game.irsexperimentalopen",
+  sLabel = "EXPERIMENTAL: allow opening untested or unfinished rides",
+  sToolTip = "Experimental. Lets untested or unfinished rides be opened; while such a ride is open, guests treat it as Excitement 8, Fear 8, Nausea 4, and it stays open after a crash. Untick to restore normal behaviour. Resets to off when a park is loaded."
+}
+IgnoreRideSafety.tExperimentalChannel = {"irs_exp_begin", "irs_exp_bit0", "irs_exp_bit1", "irs_exp_push", "irs_exp_commit", "irs_exp_report"}
 
 local function GetDLLPath()
   -- package.cpath begins with "<game dir>\?.dll"
@@ -90,6 +99,22 @@ function IgnoreRideSafety.LoadNative()
       tNative[sName] = fn
     end
   end
+  -- experimental entry points are optional: the stable options work without them
+  local bExp = true
+  local tExp = IgnoreRideSafety.tExperimental
+  local tNames = {tExp.sEnable, tExp.sDisable, tExp.sStatus}
+  for _, sName in ipairs(IgnoreRideSafety.tExperimentalChannel) do
+    tNames[#tNames + 1] = sName
+  end
+  for _, sName in ipairs(tNames) do
+    local fn = package.loadlib(sPath, sName)
+    if fn == nil then
+      bExp = false
+    else
+      tNative[sName] = fn
+    end
+  end
+  tNative.bExperimental = bExp
   IgnoreRideSafety.tNative = tNative
   return tNative
 end
@@ -146,6 +171,7 @@ function IgnoreRideSafety.InstallOptionsHook()
     for _, sKind in ipairs(tOrder) do
       self.tIRSPending[sKind] = IgnoreRideSafety.IsEnabled(sKind)
     end
+    self.tIRSPending.experimental = IgnoreRideSafety.IsEnabled("experimental")
     return r
   end
   GameOptionsMenu.GetItems = function(self, _tSettingsMenuItemsData, ...)
@@ -169,6 +195,28 @@ function IgnoreRideSafety.InstallOptionsHook()
           enabled = bAvailable
         }
       end
+      local m = IgnoreRideSafety.oManager
+      if m.tNative ~= nil and m.tNative.bExperimental then
+        local tExp = IgnoreRideSafety.tExperimental
+        local bExpAvailable = bAvailable and m.tStatus.experimental ~= IgnoreRideSafety.ST_UNSUPPORTED
+        tItems[#tItems + 1] = {
+          id = tExp.sID,
+          label = UIText(tExp.sLabel),
+          toolTip = UIText(bExpAvailable and tExp.sToolTip or "Unavailable: experimental code checks failed; see IgnoreRideSafety.log"),
+          itemRendererClass = OptionsMenuGUI.CHECK_BOX,
+          toggled = self.tIRSPending ~= nil and self.tIRSPending.experimental == true,
+          enabled = bExpAvailable
+        }
+        if m:IsEnabled("experimental") then
+          for _, sLine in ipairs(m:GetDiagnosticLines()) do
+            tItems[#tItems + 1] = {
+              id = "game.irsdiag" .. #tItems,
+              label = UIText(sLine),
+              itemRendererClass = OptionsMenuGUI.LABEL
+            }
+          end
+        end
+      end
     end
     return r
   end
@@ -179,6 +227,14 @@ function IgnoreRideSafety.InstallOptionsHook()
         self.tIRSPending[sKind] = _arg == true
         return true
       end
+    end
+    if _sID == IgnoreRideSafety.tExperimental.sID then
+      self.tIRSPending = self.tIRSPending or {}
+      self.tIRSPending.experimental = _arg == true
+      return true
+    end
+    if type(_sID) == "string" and string.sub(_sID, 1, 11) == "game.irsdia" then
+      return true
     end
     return fnHandleEvent(self, _sID, _arg, ...)
   end
@@ -191,6 +247,10 @@ function IgnoreRideSafety.InstallOptionsHook()
         if bWant ~= nil and bWant ~= m:IsEnabled(sKind) then
           m:SetEnabled(sKind, bWant)
         end
+      end
+      local bWantExp = self.tIRSPending.experimental
+      if bWantExp ~= nil and bWantExp ~= m:IsEnabled("experimental") then
+        m:SetExperimental(bWantExp)
       end
     end
     return r
