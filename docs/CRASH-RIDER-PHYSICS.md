@@ -140,6 +140,67 @@ taken (no status line, no logging). Nothing here changes the "Unresolved" table.
 **Still open from the proposal:** the displayed status, group-wide behaviour (members checked), recovery duration, and any stranded guests.
 These would need a repeat under the original conditions: disposable copy, all options off, empty test run.
 
+### Plan: logging-only diagnostic 0.2.0-diag.2 for natural bystander physics (proposal, not built)
+Goal: connect one natural impact to its group request, Physics entry, per-guest launch and recovery, using real guest and group IDs.
+**No injected launch, no state change, no bypassed check.** The rider prototype stays blocked, and its code (`irs_proto.c`) is **not part of
+this build**.
+
+**Activation:** a new checkbox "DIAGNOSTIC: log guest physics (observation only)", off by default. It installs **only** the logging hooks
+below. It does **not** apply any gameplay patch: the open gate, rating evaluator, join checks, IsClosed and close hooks stay unpatched,
+and safety, nausea and EXPERIMENTAL stay unticked. Hooks are applied all-or-nothing, with build checks, read back after install, and
+removed on untick.
+
+**Hooks** (entry hooks with the existing wrapper; each reads only what the hooked routine itself reads at that point; events go to the
+existing ring buffer and are logged from the script thread). All entries are function starts, 8-byte aligned, with relocatable first
+bytes inside one aligned word:
+
+| # | Routine | Logged |
+|---|---|---|
+| D1 | impact receiver `0x1406b58b0` (new) | per event: guest id, reason, source id. Group index by a read-only lookup in its guest→group map (`+0x218`; same hash and node layout as the emulator-verified lookups). **Entry-check values:** group `+8`, `+9`, behaviour `+0x1a`, `+0xd8`, source id vs `+0x9a50`, per-group entry match, request already pending. The rule's outcome is logged as *predicted* accept/reject. |
+| D2 | post group request `0x1406f0a00` (new) | group index, reason, source id, caller (impact receiver or `0x1406b4c30`) |
+| D3 | request receiver `0x1406a8bc0` (new) | per request: group index and the same entry-check values, predicted accept/reject |
+| D4 | enter-Physics `0x14069c8a0` (new) | group index, previous behaviour, reason, vec3, **member list** (guest ids of `[rec+0]..[rec+4]`, at most 16) |
+| D5 | physics start `0x14067d450` (**reused**, diag.1 site 9) | guest id, group key, caller (expected: protected `0x14408ee69`) |
+| D6 | guest-physics update `0x14067de10` (**reused** from proto.1, launch code removed) | for guests seen in D5: per-tick membership in the physics guest map and presence of their group key (emulator-verified read-only lookups), timer; transitions are logged with times |
+| D7 | SOS step `0x140680af0` (new) | guest id (`[r9]`) when a guest goes to the stranded state |
+| D8 | recovery receiver `0x1406a8ed0` (new) | group index, behaviour, `+8`, `+9`, predicted proceed/skip |
+| D9 | exit-behaviour `0x14069cec0` (new) | only when the group's behaviour is Physics: group index and member guest ids (GuestPhysics removal) |
+| D10 | purge `0x14081a0a0` (**reused**, diag.1 site 8) | crash anchor (destroyed-vehicle listener) and the known-event control |
+
+**Script side (no game state changes):**
+* register a receiver for `GuestPhysicsIncidentEnded` and log `nGuestsInvolved`; this is the only claim of a message firing, and it rests on the log;
+* for the guests and groups seen in D4 (passed to the scripts through a small bit-wise read channel), log `GetGuestGroupID` and
+  `GetGroupDecisionState().sBehaviour` every 0.5 s while active. This cross-checks the native group index against the script group ID
+  and records the status the guest panel shows.
+**Logging bounds:** event lines are capped (as in diag.1). D9 and D6 log only for groups and guests already seen in D4 and D5.
+
+**What it could resolve:**
+* the actual guest and group IDs along one natural chain (impact → request → enter-Physics → per-member launch → recovery), which tests
+  the **inferred pairing** of the impact event, the request and the recovery message with their receivers through matching IDs and order;
+* that the **script group ID equals the native group index** (cross-check), in practice;
+* **which members** enter physics (D4 member list against D5 launches) and which leave, and when (D6, D9). This decides group-wide entry;
+* whether the launch follows the GuestPhysics component add for each member with key = group index. This is observational support for the
+  hidden link, though its internals stay hidden;
+* the observed **values** of the entry checks for accepted and rejected impacts;
+* recovery and stranding timing, and whether `GuestPhysicsIncidentEnded` fired (logged).
+
+**What would remain:**
+* the **meaning** of `+8`, `+9`, `+0xd8`, the reason-2 check and `+0x9a50` (only values are seen);
+* the **internals** of the protected launch and teardown, and formal message-type registration (pairing would be supported, not proven);
+* other entry paths: partially addressable, since a D5 launch without a preceding D4 would reveal one, but absence proves nothing;
+* anything about riders or crash-site positioning.
+**Risks:** hooks run inside hot game code (D6 every tick, D9 on every behaviour change). They can still crash or slow the game.
+Recovery is to untick the option, or to switch back to 0.2.0-exp.6 with the game closed.
+
+**Test procedure (owner, after approval and install):**
+1. Load the park, then immediately **Save As** a new disposable name. That is the only save in the session; never save again.
+2. In Settings → Game, tick **only** "DIAGNOSTIC: log guest physics". Leave safety, nausea and EXPERIMENTAL unticked. Check that the header
+   reads 0.2.0-diag.2.
+3. Known-event control: on any ride, click "move entrance" and then cancel.
+4. Make sure the unfinished coaster is **closed** and its crash zone is over a busy path. Run up to **3 Test runs or 15 minutes**.
+5. If a guest falls: click them and note the status line and whether the listed group members also fell, then time how long until they get up.
+6. Stop on any instability. Quit **without saving**. The log is read afterwards; nothing needs to be sent.
+
 ### Proposed observation-only test of normal bystander physics (proposal; session 1 above ran with deviations)
 Purpose: watch the game's **own** crash-to-bystander physics once, with no new code, to check the statically found path against reality.
 * **Setup (disposable copy of a park):** an unfinished coaster whose open track end points over a busy footpath (debris lands among
