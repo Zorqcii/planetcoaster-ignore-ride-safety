@@ -131,5 +131,8 @@ Evidence (owner's game, Planet Coaster 1.13.3.88540 / Steam build 14428432, Prot
   safety and nausea options behave as in 0.1.0-beta.
 * Crash observer (0.2.0-exp.6): GuestPhysicsIncidentEnded 0, GuestHidden 0, trapped guests 0 across several crashes with riders aboard;
   "EnteredSoSFromCrash" and "GroupPhysicsRecovery" are not exposed to Lua in this game. Owner: riders appear at the exit.
+  These zeros alone do not prove that no guest physics occurs (two messages are unobservable and the receiver was never validated against
+  a known incident); see `CRASH-RIDER-PHYSICS.md`. Which game code moves the riders to the exit is unidentified.
 
-Note: 0.2.0-exp.6 changed only Lua; its `IgnoreRideSafety.dll` is byte-identical to 0.2.0-exp.5 and its log header says "0.2.0-exp.5".
+Note: 0.2.0-exp.6 changed only Lua; its `IgnoreRideSafety.dll` is byte-identical to 0.2.0-exp.5 and its log header (and `switch-install.sh --status`)
+says "0.2.0-exp.5". Before any publication the diagnostics must show package and component versions separately (see `CRASH-RIDER-PHYSICS.md`).

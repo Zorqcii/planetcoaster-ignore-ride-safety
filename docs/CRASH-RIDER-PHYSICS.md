@@ -1,62 +1,77 @@
 # Feasibility: crash passengers using the game's guest physics ("RCT-style riders")
 
 Branch `experimental/crash-rider-physics`, from the unfinished-rides checkpoint `4e34994`. **Investigation only: no behaviour change.**
-Bounded to about one hour of active work; about 15 minutes were used. The remaining questions need either the protected code or a live test (see the end of this file). Addresses are for game build 1.13.3.88540.
+Time box: about one hour of active work. About 20 minutes were used. The investigation stopped because no credible entry point for seated
+passengers emerged (see "Result"), not because time ran out. Static analysis of targeted functions only; no full decompilation.
+Addresses are for game build 1.13.3.88540.
 
-## Diagnostics re-checked: is "0 physics incidents" real?
-* **Confirmed real.** When a crashed train is removed, the train-removed handler (`0x1405d3fb0`) calls the engine's "purge all guests from a ride"
-  routine `0x14081a0a0` twice (`0x1405d403c` ride, `0x1405d4083` station). This is the same routine behind the script call `rides:PurgeAllRideGuests`.
-  Passengers are moved straight to the exit; they never enter guest physics. The zero counts and the owner's observation agree.
-* `GuestEnteredSoSFromCrashMessage` and `GroupPhysicsRecoveryMessage` exist natively but are not exposed to Lua, so the observer could not count them.
-  Statically they are **sent** by the guest system's physics update (`0x14067de10`), which only acts on guests already in physics.
+## Result
+| Question | Status |
+|---|---|
+| 1. The existing guest-physics / recovery system | **Found** (readable code) |
+| 2. The mechanism that starts a physics incident | **Partly found**: the low-level start routine is readable; the code that decides to start one is in the protected region |
+| 3. Whether that mechanism can safely work for seated passengers | **Not established**: no evidence either way |
+| Train-destruction code as a targeted route | **Not credible** with current evidence (see below) |
 
-## The game's own "flung guest" mechanism
-* **Entry point (credible):** `0x14067d450`. It adds to a guest a `PhysicsRigidBody` with a `PhysicsConvexHullShape` in `/MainPhysicsWorld`,
-  surface group `Character`, surface `Flying`. It then counts the incident (`+0x288`) and sets a 5 s timer (`+0x290`, 5.0f).
-* **Inputs (from its code):** `rcx` = guest-system object (the one holding `+0x288/+0x290`); `rdx` = pointer to the guest entity id;
-  `r8` = pointer to a small record:
-  * `+0`: 32-bit **incident-group key**. It finds or creates a group in a hash map at `+0x248` (`0x1406e9110`). A group (0x3e0 bytes) has
-    room for about **6 guests** (one car's riders). The routine does **not** check capacity, so the caller must.
-  * `+4..+0x10`: four 32-bit values copied into the guest's group slot (`+0x2fc..+0x308`). In readable code they are only written
-    (here and in slot compaction); any reader is indirect or protected. **Meaning unconfirmed** (launch motion is a guess).
-  * `r9`: **unused** (its home slot is reused as a local).
-* The routine sets **no position and no velocity**. The rigid body is added to the guest entity where it stands. Body parameters are
-  constants (-0.1, 0.75). Initial motion, if any, comes from elsewhere (possibly the group values or the protected caller).
-* **Caller:** only one, at `0x14408ee64`, **inside the executable's protected (obfuscated) region**. The game's own decision to fling a guest,
-  and how it fills the record, cannot be read with this project's targeted method.
-* **Recovery / stranding:** handled in plain code by the per-tick update `0x14067de10`. It ends the incident (sends `GuestPhysicsIncidentEnded`
-  via `0x1406f0860`) or moves a stranded guest to SOS (`GuestEnteredSoSFromCrash`, after `0x140680af0`). The trapped-guest system
-  (`guests:GetTrappedGuestCount`) exists.
-* Several methods of the `GuestPhysics` component manager (method table `0x1419e8c80`) are also in the protected region.
+Recommendation: keep the working crash loop (0.2.0-exp.6) with passengers returning to the exit as the completed experimental milestone.
 
-## Availability at crash time
-* Passenger identities: yes (seat occupants; `rides:GetGuestsOnRide`; the purge routine iterates them).
-* Crash position: plausibly yes (car/seat world transforms before the purge). Crash motion (velocity): not established.
-* Guest-system object: not directly available in the train handler. It is passed as `rcx` to the guest update `0x14067de10` every tick
-  (an aligned entry, `mov rax,rsp ; push rbp ; push rbx` = 5 bytes), so it could be captured there. Confirmed same object type:
-  the update reads the same group map (`+0x248`) and the `+0x198` field the fling routine uses.
+## Diagnostics: what the zero counts do and do not show
+The 0.2.0-exp.6 crash observer counted `GuestPhysicsIncidentEnded` 0, `GuestHidden` 0 and trapped guests 0 over several crashes with riders aboard.
+**This is not proof that guest physics never occurs in these crashes:**
+* `GuestEnteredSoSFromCrashMessage` and `GroupPhysicsRecoveryMessage` are not exposed to Lua, so two of the relevant messages could not be observed at all.
+* The receiver was never validated against a known physics incident. It has never been seen to count anything, so "missed" and "did not happen"
+  cannot be told apart from these numbers alone.
+* The counts are consistent with the owner's observation (riders reappear at the exit, nobody seen flying), and that observation is the stronger evidence.
 
-## Interactions
-* Purge first, then fling: the guest is detached and valid but stands at the exit. It would be flung from the exit unless repositioned first;
-  no safe reposition method is established.
-* Fling before purge: the guest is still attached to a seat on a train being destroyed. High risk.
-* After a fling, the game's own update would land, recover or strand the guest. The 32-bit key and four values in the record are not fully understood.
+**Correction to the first version of this file.** It said the train-removed handler `0x1405d3fb0` purges the passengers (via `0x14081a0a0`,
+the routine behind `rides:PurgeAllRideGuests`), and called the zero count confirmed. The 0.2.0-exp.4/exp.5 logs contradict that this handler ran in
+these crashes. Its purge calls (`0x1405d403c`, `0x1405d4083`) are on one straight path to its `IsClosed` call (`0x1405d40aa`), which exp.4/exp.5
+hooked, yet across 18 crash closes:
+* the hook never reported "kept a listed ride open" (exp.5 listed both the station id and the ride id);
+* no close request came from the handler's own close call (only from the close-all routine `0x140815460`, called by the crash handler).
+Possible explanations: the handler is not called for this crash type, or its early exit (`+0x439`/`+0x438` flags → `0x1405d4199`) skips the purge,
+or the id it checks is of a type the list did not contain. **Which code moves the riders to the exit in this crash type is unidentified.**
 
-## Assessment
-Plausible but uncertain. A credible entry point exists with partly understood inputs, but:
-(1) the game's own caller is obfuscated, so correct argument values are inferred, not observed;
-(2) passengers are already at the exit when they become safe to fling, and moving them back to the crash site is unsolved;
-(3) the effects of the record's unknown fields, and of flinging guests that never came from the game's own trigger, are untested.
+## 1. The existing physics / recovery system (found)
+* Per-tick guest-physics update `0x14067de10` (readable). It ends incidents (sends `GuestPhysicsIncidentEnded` via `0x1406f0860`),
+  moves stranded guests to SOS (`GuestEnteredSoSFromCrash`, after `0x140680af0`), and handles group recovery (`GroupPhysicsRecovery`).
+* State on the guest-system object: incident counter `+0x288`, timer `+0x290`, incident groups in a hash map at `+0x248`.
+* The trapped-guest system (`guests:GetTrappedGuestCount` / `GetNextTrappedGuest`) exists.
+* The achievement script awards `CoasterCrash` from `GuestPhysicsIncidentEndedMessage.nGuestsInvolved`. So the game was built with a crash path
+  in which coaster riders become a physics incident. The unfinished-track derailment observed here does not use it.
 
-## Decision inputs
-* Confirmed: purge-to-exit path; fling entry point and its argument shapes; group capacity (~6, unchecked); r9 unused; no position or velocity
-  set by the entry; where the guest-system object can be captured.
-* Hypothetical: meaning of the four group values; whether a guest flung outside the game's own trigger lands and recovers normally;
-  any way to place a guest at the crash site (none found); crash velocity.
-* Not attempted (out of scope): reading the protected caller; any behaviour change.
+## 2. The mechanism that starts an incident (partly found)
+* **Low-level start routine `0x14067d450` (readable).** It adds a `PhysicsRigidBody` with a `PhysicsConvexHullShape` in `/MainPhysicsWorld`
+  (surface group `Character`, surface `Flying`) to the guest entity. It then increments the incident counter and sets a 5 s timer.
+  * `rcx` = guest-system object; `rdx` = pointer to the guest entity id; `r9` unused (its home slot is reused as a local).
+  * `r8` = pointer to a record. `+0`: 32-bit incident-group key, which finds or creates a group (`0x1406e9110`). A group has room for
+    about **6 guests** (one car); capacity is **not** checked here.
+  * `+4..+0x10`: four 32-bit values copied into the guest's group slot. In readable code they are only ever written; their meaning is unknown.
+  * It sets **no position and no velocity**, and has **no seat or ride code**: it does not detach a guest from a vehicle.
+* **Decision code (protected).** The routine's only caller is at `0x14408ee64`, inside protected function `0x14408ee20`. Readable code reaches it
+  only through a jump stub at `0x1406de9e0`, which has **no** static references (no call, pointer or RVA). The GuestPhysics manager's
+  method table `0x1419e8c80` also points into the protected region. Following the trigger further means decompiling protected code,
+  which is out of scope.
+* The guest-system object can be captured at the entry of `0x14067de10` (aligned, `mov rax,rsp ; push rbp ; push rbx`). The update uses the same
+  group map (`+0x248`) and `+0x198` field as the start routine.
 
-## Smallest reversible test (proposal only, not implemented)
-Off-by-default diagnostic build. After the game purges a crashed train's riders to the exit, call the fling entry for **one** rider of a
-listed ride, using a fresh group key and zeros in the four values, with the guest-system object captured at the update entry.
-It answers one question: does an externally started incident behave like the game's own (flying body, incident ended or SOS, guest recovers)?
-It does **not** put riders at the crash site.
+## 3. Seated passengers (not established)
+* The start routine does not detach a guest from a seat or train. Whatever the game does for `CoasterCrash` riders (detach, place, then start)
+  happens in code that was not found, most likely the protected caller.
+* Calling the start routine on a guest still attached to a train that is being destroyed is high risk (dangling seat or vehicle references).
+* Calling it after the riders reach the exit is plausible but only launches them from the exit; that is not the requested behaviour.
+* Passenger ids are available (seat occupants, `rides:GetGuestsOnRide`). Crash position is plausibly available; crash velocity is not established.
+
+## Smallest next experiment (only if this is revisited; not built)
+An **observe-only** helper build: log-only entry hooks on the purge routine `0x14081a0a0`, the train-removed handler `0x1405d3fb0` and the start
+routine `0x14067d450`, each recording its return address. During one crash on a copied park it would show which of them runs, which code moves
+riders to the exit, and whether any incident is started. It changes no behaviour, so detachment, exit unloading and recovery stay as the game
+does them. Recovery: untick the option, or switch back to exp.6 with the game closed. A behaviour prototype (detach, place at the crash site,
+start an incident, then let the game recover the guests) should only be considered if that log reveals readable detach code.
+
+## Version labels (0.2.0-exp.6 milestone)
+The package and its Lua scripts are **0.2.0-exp.6**. The native helper `IgnoreRideSafety.dll` is unchanged from 0.2.0-exp.5 (byte-identical,
+sha256 `4f37f8de…`), so its log header says "Ignore Ride Safety 0.2.0-exp.5". `tools/dev/switch-install.sh --status` reads the DLL and also
+prints "0.2.0-exp.5". The in-game Settings heading shows the Lua (package) version.
+**Before any future publication:** the diagnostics must name both parts, e.g. "package 0.2.0-exp.6 (scripts 0.2.0-exp.6, helper 0.2.0-exp.5)".
+This applies to the log header, the in-game diagnostics list and `--status` (which should also read the package version).
