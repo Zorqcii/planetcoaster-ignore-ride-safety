@@ -96,7 +96,7 @@ Limits (stated before the test):
 * A purge at the crash, followed by riders reaching the exit, is timing evidence. It is strong but not proof that it is the only mover.
 * Observation hooks run inside game code and can still cause crashes or slowdowns. This build is not risk-free.
 
-## Diagnostic build 0.2.0-diag.1 (built, not yet tested)
+## Diagnostic build 0.2.0-diag.1 (tested 2026-10-03, results below)
 Package `IgnoreRideSafety-DIAGNOSTIC-0.2.0-diag.1.zip` (built by `tools/make_diagnostic.sh`; not published). Behaviour is that of
 0.2.0-exp.6. Added only while the EXPERIMENTAL option is on:
 * entry hooks at `0x1405d3fb0`, `0x14081a0a0`, `0x14067d450` (sites 7-9, `native/irs_diag.c`). Each saves the argument registers,
@@ -117,6 +117,41 @@ Log lines to read after the test:
 * `PURGE from 0x14046c09e (script rides:PurgeAllRideGuests (positive control))` (known-event control, with the ride's id);
 * around each `CRASH-CLOSE ... listed`: any `TRAIN-REMOVED`, `PURGE` and `PHYSICS-START` events, their callers and times;
 * `riders on open untested rides: N` before and after the crash.
+
+## Diagnostic round 1 result (0.2.0-diag.1, manual test 2026-10-03)
+Owner's copied park, unfinished coaster (station 206, ride 204), about 15 minutes, 7 crashes with up to 24 riders each.
+* **Installation:** "observation hooks installed and read back OK".
+* **Positive control passed:** each "move entrance"/"move exit" click logged `PURGE from 0x14046c09e (rides:PurgeAllRideGuests)` with
+  the ride id 204. The owner saw that ride's guests reappear at the exit. The hook method works on a known event.
+* **Each crash:** six `CRASH-CLOSE` events (crash handler, ride 204, close skipped) within about 0.3 s, then about 1.8 s later **one**
+  `PURGE from 0x14081bb14` with a single id that is neither the ride nor the station (354, 29224, 29722, 30104, 30533, 30985, 31391:
+  a new id each crash, most likely the destroyed vehicle). The script's rider count went from 22-24 to 0 between the 3-s samples
+  around it. 7 of 7 crashes followed this pattern.
+* **Train-removed handler `0x1405d3fb0`: 0 calls** in the whole session (unfiltered entry hook, read back OK). It is not part of this crash.
+* **Guest-physics start `0x14067d450`: 0 calls** in the whole session. No guest, passenger or bystander, entered guest physics.
+* Side finding: ticking the experimental option (its attraction refresh) and editing the entrance each caused
+  `PURGE from 0x140856a8b` for the station (206). Refreshing the attraction purges that station's guests, as closing a station does.
+
+Caller `0x14081bb0f` is in `0x14081b9a0` (readable, reached through a dispatcher jump at `0x14088dcb4`). It walks a list of entities
+and their sub-entities, keeps the ids that the purge system's ride/vehicle map (`+0x198`) knows, and purges those: a
+"vehicle destroyed → remove its guests" listener.
+
+### Conclusions (proportional to the evidence)
+* **Detachment in this crash is identified with direct evidence:** the destroyed-vehicle listener calls the same purge routine as
+  `rides:PurgeAllRideGuests`. Its timing (≈1.8 s after the crash close, every crash) matches riders leaving the ride. The positive control
+  shows this routine puts guests at the exit. That is strong evidence, but it does not prove the purge is the only mover.
+* **No transfer into physics happens in this crash.** The physics start routine is never called. So there is no game path to piggy-back on;
+  any physics would have to be started by the mod.
+* The guest-physics update `0x14067de10` is called unconditionally once per world update from `0x1400b06a0`. Its object (needed by the start
+  routine) could be captured there.
+
+### Remaining blocker
+No mechanism has been observed or identified that **safely transfers a detached passenger into physics**:
+1. the physics start routine has never been seen running in this game session, its own caller is protected, and the effect of calling it
+   on a guest the game has just unloaded (and is walking from the exit) is unknown;
+2. the purge places guests at the exit. Where in the purge that placement happens is not located, so there is no route yet to keep
+   a passenger at the crash site.
+Per the round's rules this diagnostic round stops here. Next step only by owner decision.
 
 ## Earlier proposal (superseded by the plan above)
 An **observe-only** helper build: log-only entry hooks on the purge routine `0x14081a0a0`, the train-removed handler `0x1405d3fb0` and the start
