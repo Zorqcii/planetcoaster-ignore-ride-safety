@@ -11,6 +11,7 @@ Let guests board and ride incomplete or untested roller coasters, without changi
 2. Find out whether guests can board an untested or incomplete ride, and whether it dispatches with them. **Done (0.2.0-exp.3).**
 3. Operation after a crash: the ride stays open and trains respawn for the next riders. **Done (0.2.0-exp.5).**
 4. Riders stay at the crash site and walk back, as in RollerCoaster Tycoon. **Optional extension; separate branch `experimental/crash-rider-physics`.**
+   Status 2026-10-03: unresolved within the agreed scope (not disproven); live testing closed; see `CRASH-RIDER-PHYSICS.md`.
 
 ## Earlier findings (from the pre-release experiment), re-checked
 | Finding | Status |

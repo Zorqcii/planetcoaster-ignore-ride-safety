@@ -1,20 +1,35 @@
 # Feasibility: crash passengers using the game's guest physics ("RCT-style riders")
 
 Branch `experimental/crash-rider-physics`, from the unfinished-rides checkpoint `4e34994`. **Investigation only: no behaviour change.**
-Time box: about one hour of active work. About 20 minutes were used. The investigation stopped because no credible entry point for seated
-passengers emerged (see "Result"), not because time ran out. Static analysis of targeted functions only; no full decompilation.
-Addresses are for game build 1.13.3.88540.
+Scope: targeted static analysis plus owner-run tests on a copied park; no full decompilation and no deobfuscation of the protected code.
+Addresses are for game build 1.13.3.88540. Later sections are kept in the order the work happened; this summary is current.
 
-## Result
+## Current status (2026-10-03): unresolved within the agreed scope, not disproven
+**Live testing is closed for now. 0.2.0-exp.6 stays installed** (crash loop works; riders return to the exit).
+
 | Question | Status |
 |---|---|
-| 1. The existing guest-physics / recovery system | **Found** (readable code) |
-| 2. The mechanism that starts a physics incident | **Partly found**: the low-level start routine is readable; the code that decides to start one is in the protected region |
-| 3. Whether that mechanism can safely work for seated passengers | **Not established**: no evidence either way |
-| Train-destruction code as a targeted route | **Not credible** with current evidence (see below) |
+| Existing guest-physics / recovery system | **Found** (readable per-tick update `0x14067de10`) |
+| Code that takes riders off a crashed train | **Identified in game:** destroyed-vehicle listener → purge routine → riders placed at the exit |
+| Train-removed handler `0x1405d3fb0` | **Not involved** in this crash type (observed: 0 calls) |
+| Routine that starts a physics incident | **Found** (`0x14067d450`). When called from the update context with a fresh group key, the game accepted it (incident started, timer ran, incident-ended message sent) |
+| Correct group key | **Not established in game.** Strong static evidence: the guest's group index (`GetGuestGroupID`) |
+| Group state and recovery sequence the game expects | **Unknown.** Recovery acts only on group records in state `0x0b` (very likely "Physics"); what sets it, and in what order, is in the protected caller |
+| Riders at the crash site | **Not investigated** (out of scope so far) |
 
-The working crash loop (0.2.0-exp.6, passengers return to the exit) is the completed milestone and stays as it is.
-Owner decision (2026-10-03): continue with one observation-only diagnostic round (plan below) before any behaviour prototype.
+Two separate things went wrong in the prototype test, and they must not be confused:
+1. **Implementation failure (prototype's fault, explained):** the prototype supplied an **invented group ID** (`0x7a490010`) as the
+   incident-group key. The game used that value as an index into its guest-group array, and the read went outside the array. That is the
+   invalid lookup in the crash dump (`rax` = the invented key at the faulting instruction `0x1406a8f24`). This failure says nothing about
+   whether the approach can work; it shows the key must be a real group ID.
+2. **Remaining unknown (not a failure of the approach):** even before the crash, recovery did not complete. The guest stayed in physics after
+   the incident-ended message, and the group never showed the "Physics" behaviour. The game evidently performs further steps around the
+   start routine (at least putting the group into the Physics state). Those steps are not identified, because they are in the protected caller.
+
+The approach is therefore **unresolved within the agreed scope, not disproven.**
+**Condition for any further prototype:** no new prototype runs unless both of these have been established:
+* the real group ID to pass;
+* the required group-state and recovery sequence.
 
 ## Diagnostics: what the zero counts do and do not show
 The 0.2.0-exp.6 crash observer counted `GuestPhysicsIncidentEnded` 0, `GuestHidden` 0 and trapped guests 0 over several crashes with riders aboard.
@@ -219,16 +234,21 @@ Crash analysis (static):
   that state; how it does so is unknown.
 
 Conclusions:
-* **The crash was caused by the prototype** (invented group key used as an array index by the game). Seen once; not a game bug.
-* The physics start routine can be entered from the update context without an immediate failure. The incident timer runs and the
-  incident-ended message is sent. But **recovery did not complete**: the guest "stayed" and did not leave the physics map in ≥ 6 s after
-  the incident ended, and the group never entered the Physics behaviour.
-* A safe transfer needs (a) the guest's real group index as the key and (b) the group put into the game's Physics behaviour state
-  the way the game does it. (b) lives in the protected caller and is not identified. Using the real key alone would most likely avoid
-  this crash, but the handler would then skip the group (state not 0x0b), leaving the guest stuck. That outcome is predicted, not tested.
+* **Implementation failure:** the crash came from the prototype's **invented group ID**. The game used it as an index into its guest-group array
+  and read outside it. This was seen once, is explained by the prototype's input, and is not a game bug. It does not show that the approach is unworkable.
+* **What worked:** the physics start routine can be entered from the update context without an immediate failure. The incident timer runs
+  and the incident-ended message is sent.
+* **What remains unknown:** recovery did not complete. The guest "stayed" and did not leave the physics map in ≥ 6 s after the incident
+  ended, and the group never entered the Physics behaviour. Working recovery needs:
+  * (a) the guest's real group ID as the key (strong static evidence; not confirmed in game);
+  * (b) the group-state and recovery sequence the game performs around the start routine (at least putting the group into the
+    Physics state, `0x0b`).
+  (b) lives in the protected caller and is not identified. Using the real key alone would most likely avoid this crash, but the
+  receiver would then skip the group (state not `0x0b`), probably leaving the guest stuck. That is a prediction, not a test result.
 
-**Decision: stop.** No further prototype without a way to establish (b). The installed build was switched back to 0.2.0-exp.6
-(hashes verified); the prototype and diagnostic packages and the test logs are kept locally.
+**Status: unresolved within the agreed scope, not disproven.** Live testing is closed. No further prototype unless (a) and (b) have been
+established. The installed build was switched back to 0.2.0-exp.6 (hashes verified, and the owner confirmed it stays installed). The
+prototype and diagnostic packages, the test logs and the crash dump are kept locally, outside Git.
 
 ## Earlier proposal (superseded by the plan above)
 An **observe-only** helper build: log-only entry hooks on the purge routine `0x14081a0a0`, the train-removed handler `0x1405d3fb0` and the start
