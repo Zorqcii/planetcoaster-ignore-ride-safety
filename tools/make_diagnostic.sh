@@ -5,15 +5,23 @@
 # never writes to dist/, dist-experimental/, build/release or build/experimental.
 set -euo pipefail
 VERSION=${1:?usage: make_diagnostic.sh VERSION   (e.g. 0.2.0-diag.1 or 0.2.0-proto.1)}
-case "$VERSION" in *-diag.*) LABEL=DIAGNOSTIC; README=README-diagnostic.txt; BUILDNO=1 ;; *-proto.*) LABEL=PROTOTYPE; README=README-prototype.txt; BUILDNO=2 ;;
+VARIANT=""
+case "$VERSION" in
+  *-diag.2) LABEL=DIAGNOSTIC; README=README-physdiag.txt; BUILDNO=3; VARIANT=physdiag ;;   # logging only, no gameplay patches, no prototype
+  *-diag.*) LABEL=DIAGNOSTIC; README=README-diagnostic.txt; BUILDNO=1 ;;
+  *-proto.*) LABEL=PROTOTYPE; README=README-prototype.txt; BUILDNO=2 ;;
   *) echo "version must contain -diag. or -proto."; exit 1 ;; esac
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 grep -q "\"$VERSION $LABEL\"" "$ROOT/native/irs_patch.c" || { echo "helper version is not $VERSION $LABEL"; exit 1; }
-grep -q "#define DX_BUILD $BUILDNO " "$ROOT/native/irs_diag.c" || { echo "helper build number is not $BUILDNO"; exit 1; }
+if [ "$VARIANT" = physdiag ]; then
+  grep -q "#define PD_BUILD $BUILDNO " "$ROOT/native/irs_physdiag.c" || { echo "helper build number is not $BUILDNO"; exit 1; }
+else
+  grep -q "#define DX_BUILD $BUILDNO " "$ROOT/native/irs_diag.c" || { echo "helper build number is not $BUILDNO"; exit 1; }
+fi
 grep -q "sPackageVersion = \"$VERSION\"" "$ROOT/mod/IgnoreRideSafety/src/Database.IgnoreRideSafety.lua" || { echo "script version is not $VERSION"; exit 1; }
 BUILD="$ROOT/build/diagnostic"
 rm -rf "$BUILD"; mkdir -p "$BUILD" "$ROOT/dist-diagnostic"
-"$ROOT/native/build.sh" "$BUILD/native" >/dev/null
+IRS_VARIANT="$VARIANT" "$ROOT/native/build.sh" "$BUILD/native" >/dev/null
 "$ROOT/tools/build_pack.sh" "$BUILD/pack" >/dev/null
 STAGE="$BUILD/zip"; mkdir -p "$STAGE/IgnoreRideSafety"
 cp "$BUILD/pack/IgnoreRideSafety/Manifest.xml" "$BUILD/pack/IgnoreRideSafety/Main.ovl" "$STAGE/IgnoreRideSafety/"

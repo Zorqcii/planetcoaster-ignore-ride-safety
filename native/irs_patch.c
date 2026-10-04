@@ -67,8 +67,13 @@ __declspec(dllimport) DWORD __stdcall SetFilePointer(HANDLE, long, long *, DWORD
 __declspec(dllimport) BOOL __stdcall WriteFile(HANDLE, const void *, DWORD, DWORD *, void *);
 __declspec(dllimport) BOOL __stdcall CloseHandle(HANDLE);
 
+#ifdef IRS_PHYSDIAG
+#define IRS_VERSION "0.2.0-diag.2 DIAGNOSTIC"
+#define IRS_PACKAGE "0.2.0-diag.2"
+#else
 #define IRS_VERSION "0.2.0-proto.1 PROTOTYPE"
 #define IRS_PACKAGE "0.2.0-proto.1"
+#endif
 
 /* status codes returned to Lua */
 enum {
@@ -232,6 +237,12 @@ static int group_status(const struct group *g)
 /* Turn an option on or off. All of its sites change, or none do. */
 static int group_set(const struct group *g, int on)
 {
+#ifdef IRS_PHYSDIAG
+    if (on) {                       /* diagnostic build: no gameplay patches at all */
+        log_line("this diagnostic build does not apply gameplay patches (safety/nausea unavailable)");
+        return ST_UNSUPPORTED;
+    }
+#endif
     if (!build_supported()) {
         log_line("unsupported game build or unexpected code bytes: no changes made");
         return ST_UNSUPPORTED;
@@ -282,4 +293,9 @@ BOOL __stdcall DllMain(HANDLE inst, DWORD reason, void *reserved)
 }
 
 /* Experimental unfinished/untested-ride work (inactive unless enabled from the experimental option). */
+#ifdef IRS_PHYSDIAG
+/* DIAGNOSTIC 0.2.0-diag.2: observation hooks only; no experimental, diag.1 or prototype code. */
+#include "irs_physdiag.c"
+#else
 #include "irs_experimental.c"
+#endif

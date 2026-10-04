@@ -12,13 +12,13 @@ local pcall = global.pcall
 local ipairs = global.ipairs
 local IgnoreRideSafety = module(...)
 
-IgnoreRideSafety.sVersion = "0.2.0-proto.1 PROTOTYPE"
+IgnoreRideSafety.sVersion = "0.2.0-diag.2 DIAGNOSTIC"
 -- Package and component versions (shown separately in the options header and the log).
-IgnoreRideSafety.sPackageVersion = "0.2.0-proto.1"
-IgnoreRideSafety.sScriptsVersion = "0.2.0-proto.1"
-IgnoreRideSafety.sPackageLabel = "PROTOTYPE"
-IgnoreRideSafety.nExpectedHelperDiagBuild = 2
-IgnoreRideSafety.tHelperBuildNames = {[1] = "0.2.0-diag.1", [2] = "0.2.0-proto.1"}
+IgnoreRideSafety.sPackageVersion = "0.2.0-diag.2"
+IgnoreRideSafety.sScriptsVersion = "0.2.0-diag.2"
+IgnoreRideSafety.sPackageLabel = "DIAGNOSTIC"
+IgnoreRideSafety.nExpectedHelperDiagBuild = 3
+IgnoreRideSafety.tHelperBuildNames = {[1] = "0.2.0-diag.1", [2] = "0.2.0-proto.1", [3] = "0.2.0-diag.2"}
 
 -- Status codes returned by the native helper (see native/irs_patch.c)
 IgnoreRideSafety.ST_ON = 1
@@ -64,6 +64,15 @@ IgnoreRideSafety.tPrototype = {
   sLabel = "PROTOTYPE (research): launch one crashed rider into guest physics",
   sToolTip = "Research only, use a copied park. Needs the EXPERIMENTAL option. After a crash, one rider who has finished unloading is launched into the game's guest physics at the exit (no position or speed is set); launch and recovery are logged. Untick to stop. Resets to off when a park is loaded."
 }
+-- DIAGNOSTIC 0.2.0-diag.2 (logging only; the helper of this build has no gameplay patches)
+IgnoreRideSafety.tPhysDiag = {
+  sEnable = "irs_pd_enable", sDisable = "irs_pd_disable", sStatus = "irs_pd_status",
+  sID = "game.irsphysdiag",
+  sLabel = "DIAGNOSTIC: log guest physics (observation only)",
+  sToolTip = "Research only, use a disposable park copy. Records the game's own guest-physics events (impact, group request, entering Physics, launch, recovery) in IgnoreRideSafety.log. Changes nothing in the game. Resets to off when a park is loaded."
+}
+IgnoreRideSafety.tPhysDiagNames = {"irs_pd_build", "irs_pd_enable", "irs_pd_disable", "irs_pd_status", "irs_pd_report", "irs_pd_next", "irs_pd_bit",
+  "irs_pd_begin", "irs_pd_bit0", "irs_pd_bit1", "irs_pd_push", "irs_pd_note"}
 IgnoreRideSafety.tPrototypeNames = {"irs_pt_enable", "irs_pt_disable", "irs_pt_status", "irs_pt_poll", "irs_pt_arm", "irs_pt_result", "irs_pt_note"}
 
 -- "package X (scripts Y, helper Z)" so a mixed installation is visible.
@@ -168,6 +177,19 @@ function IgnoreRideSafety.LoadNative()
     end
   end
   tNative.bPrototype = bProto
+  local bPd = true
+  for _, sName in ipairs(IgnoreRideSafety.tPhysDiagNames) do
+    local fn = package.loadlib(sPath, sName)
+    if fn == nil then
+      bPd = false
+    else
+      tNative[sName] = fn
+    end
+  end
+  tNative.bPhysDiag = bPd
+  if bPd then
+    tNative.nHelperDiagBuild = Call(tNative.irs_pd_build)
+  end
   tNative.nHelperDiagBuild = bDiag and Call(tNative.irs_dx_build) or nil
   IgnoreRideSafety.tNative = tNative
   return tNative
@@ -227,6 +249,7 @@ function IgnoreRideSafety.InstallOptionsHook()
     end
     self.tIRSPending.experimental = IgnoreRideSafety.IsEnabled("experimental")
     self.tIRSPending.prototype = IgnoreRideSafety.IsEnabled("prototype")
+    self.tIRSPending.physdiag = IgnoreRideSafety.IsEnabled("physdiag")
     return r
   end
   GameOptionsMenu.GetItems = function(self, _tSettingsMenuItemsData, ...)
@@ -239,18 +262,44 @@ function IgnoreRideSafety.InstallOptionsHook()
         label = UIText("Mod: Ignore Ride Safety " .. IgnoreRideSafety.GetVersionText()),
         itemRendererClass = OptionsMenuGUI.LABEL
       }
+      local m = IgnoreRideSafety.oManager
+      local bNoGameplay = m.tNative ~= nil and m.tNative.bPhysDiag == true
       for _, sKind in ipairs(tOrder) do
         local tOpt = tOptions[sKind]
+        local sTip = bAvailable and tOpt.sToolTip or ("Unavailable: " .. IgnoreRideSafety.GetUnavailableReason())
+        if bNoGameplay then
+          sTip = "Not available in this diagnostic build (no gameplay patches)."
+        end
         tItems[#tItems + 1] = {
           id = tOpt.sID,
           label = UIText(tOpt.sLabel),
-          toolTip = UIText(bAvailable and tOpt.sToolTip or ("Unavailable: " .. IgnoreRideSafety.GetUnavailableReason())),
+          toolTip = UIText(sTip),
           itemRendererClass = OptionsMenuGUI.CHECK_BOX,
           toggled = self.tIRSPending ~= nil and self.tIRSPending[sKind] == true,
-          enabled = bAvailable
+          enabled = bAvailable and not bNoGameplay
         }
       end
-      local m = IgnoreRideSafety.oManager
+      if bNoGameplay then
+        local tPd = IgnoreRideSafety.tPhysDiag
+        local bPdAvailable = bAvailable and m.tStatus.physdiag ~= IgnoreRideSafety.ST_UNSUPPORTED
+        tItems[#tItems + 1] = {
+          id = tPd.sID,
+          label = UIText(tPd.sLabel),
+          toolTip = UIText(bPdAvailable and tPd.sToolTip or "Unavailable: diagnostic code checks failed; see IgnoreRideSafety.log"),
+          itemRendererClass = OptionsMenuGUI.CHECK_BOX,
+          toggled = self.tIRSPending ~= nil and self.tIRSPending.physdiag == true,
+          enabled = bPdAvailable
+        }
+        if m:IsEnabled("physdiag") then
+          for _, sLine in ipairs(m:GetPhysDiagLines()) do
+            tItems[#tItems + 1] = {
+              id = "game.irsdiag" .. #tItems,
+              label = UIText(sLine),
+              itemRendererClass = OptionsMenuGUI.LABEL
+            }
+          end
+        end
+      end
       if m.tNative ~= nil and m.tNative.bExperimental then
         local tExp = IgnoreRideSafety.tExperimental
         local bExpAvailable = bAvailable and m.tStatus.experimental ~= IgnoreRideSafety.ST_UNSUPPORTED
@@ -300,6 +349,11 @@ function IgnoreRideSafety.InstallOptionsHook()
       self.tIRSPending.experimental = _arg == true
       return true
     end
+    if _sID == IgnoreRideSafety.tPhysDiag.sID then
+      self.tIRSPending = self.tIRSPending or {}
+      self.tIRSPending.physdiag = _arg == true
+      return true
+    end
     if _sID == IgnoreRideSafety.tPrototype.sID then
       self.tIRSPending = self.tIRSPending or {}
       self.tIRSPending.prototype = _arg == true
@@ -332,6 +386,11 @@ function IgnoreRideSafety.InstallOptionsHook()
         m:SetPrototype(true)
       end
       self.tIRSPending.prototype = m:IsEnabled("prototype")
+      local bWantPd = self.tIRSPending.physdiag
+      if bWantPd ~= nil and bWantPd ~= m:IsEnabled("physdiag") then
+        m:SetPhysDiag(bWantPd)
+      end
+      self.tIRSPending.physdiag = m:IsEnabled("physdiag")
     end
     return r
   end

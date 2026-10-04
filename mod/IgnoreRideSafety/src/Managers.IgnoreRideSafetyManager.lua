@@ -30,6 +30,11 @@ local function ToIntegerOrZero(_n)
   return ToInteger(_n) or 0
 end
 local c_nProtoInterval = 0.25
+local c_nPdInterval = 0.5
+-- full behaviour table of GetGroupDecisionState().sBehaviour (index = game code)
+local c_tBehaviourIndex = {Idle = 0, Navigating = 1, Lost = 2, Queueing = 3, OnRide = 4, Exiting = 5, AtShop = 6, AtBench = 7,
+  AtEntertainer = 8, Suspended = 9, Trapped = 10, Physics = 11, AtSecurityGuard = 12, AtVandalismTarget = 13, WatchingFireworks = 14,
+  WatchingScreen = 15, AtVistaPoint = 16, ExternallyHandled = 17, AtGhost = 18}
 -- group behaviour names (GetGroupDecisionState().sBehaviour) -> codes used in the log
 local c_tBehaviourCode = {Physics = 1, Trapped = 2, Navigating = 3, Idle = 4, Lost = 5, OnRide = 6, Queueing = 7, AtSecurityGuard = 8}
 -- behaviours in which a rider is NOT launched
@@ -58,7 +63,11 @@ IgnoreRideSafetyManager.Init = function(self, _tProperties, _tEnvironment)
   self.nClock = 0
   self.tRiderSnapshot = {tIds = {}, tRideOf = {}}
   self:ResetProto()
+  self:ResetPd()
   if self.tNative then
+    if self.tNative.bPhysDiag then
+      self.tStatus.physdiag = IRS.Call(self.tNative[IRS.tPhysDiag.sDisable])
+    end
     for _, sKind in ipairs(IRS.tOptionOrder) do
       self.tStatus[sKind] = IRS.Call(self.tNative[IRS.tOptions[sKind].sDisable])
     end
@@ -106,6 +115,131 @@ IgnoreRideSafetyManager.SetExperimental = function(self, _bEnabled)
     self.tStatus.prototype = IRS.Call(self.tNative[IRS.tPrototype.sStatus])
   end
   return self.tStatus.experimental == (_bEnabled and IRS.ST_ON or IRS.ST_OFF)
+end
+
+-- DIAGNOSTIC 0.2.0-diag.2 (logging only) ----------------------------------
+
+IgnoreRideSafetyManager.ResetPd = function(self)
+  self.tPd = {nTimer = 0, tGroups = {}, nGroups = 0, tGuestsSeen = {}, nGuestsSeen = 0, nTrapped = nil, nMessages = 0, nItems = 0}
+end
+
+IgnoreRideSafetyManager.SetPhysDiag = function(self, _bEnabled)
+  if not self.tNative or not self.tNative.bPhysDiag then
+    return false
+  end
+  local tPd = IRS.tPhysDiag
+  self.tStatus.physdiag = IRS.Call(self.tNative[_bEnabled and tPd.sEnable or tPd.sDisable])
+  self:ResetPd()
+  pcall(self.StopPdObserver, self)
+  if self.tStatus.physdiag == IRS.ST_ON then
+    pcall(self.StartPdObserver, self)
+  end
+  IRS.Call(self.tNative.irs_pd_report)
+  return self.tStatus.physdiag == (_bEnabled and IRS.ST_ON or IRS.ST_OFF)
+end
+
+-- values -> helper log line (channel: begin, bits MSB first, push; then irs_pd_note)
+IgnoreRideSafetyManager.PdNote = function(self, _tValues)
+  local tN = self.tNative
+  IRS.Call(tN.irs_pd_begin)
+  for _, nId in ipairs(_tValues) do
+    local nHigh = 63
+    while nHigh > 0 and ((nId >> nHigh) & 1) == 0 do
+      nHigh = nHigh - 1
+    end
+    for b = nHigh, 0, -1 do
+      if ((nId >> b) & 1) == 1 then
+        IRS.Call(tN.irs_pd_bit1)
+      else
+        IRS.Call(tN.irs_pd_bit0)
+      end
+    end
+    IRS.Call(tN.irs_pd_push)
+  end
+  IRS.Call(tN.irs_pd_note)
+end
+
+IgnoreRideSafetyManager.StartPdObserver = function(self)
+  local nType = api.messaging.MsgType_GuestPhysicsIncidentEndedMessage
+  if nType == nil then
+    return
+  end
+  local fn = function(_tMessages)
+    for _, tMsg in ipairs(_tMessages or {}) do
+      self.tPd.nMessages = self.tPd.nMessages + 1
+      if type(tMsg) == "table" then
+        pcall(self.PdNote, self, {3, ToIntegerOrZero(tMsg.nGuestsInvolved)})
+      end
+    end
+  end
+  api.messaging.RegisterReceiver(nType, fn)
+  self.fnPdReceiver = fn
+  self.nPdReceiverType = nType
+end
+
+IgnoreRideSafetyManager.StopPdObserver = function(self)
+  if self.fnPdReceiver ~= nil then
+    api.messaging.UnregisterReceiver(self.nPdReceiverType, self.fnPdReceiver)
+  end
+  self.fnPdReceiver = nil
+end
+
+-- every 0.5 s while on: take ids from the helper, cross-check them with public guest functions,
+-- record displayed group behaviour changes and the trapped count; then flush the helper's log.
+IgnoreRideSafetyManager.PdTick = function(self)
+  local tN = self.tNative
+  local tW = api.world.GetWorldAPIs()
+  local p = self.tPd
+  for _ = 1, 16 do
+    local nKind = IRS.Call(tN.irs_pd_next)
+    if nKind ~= 3 and nKind ~= 4 then
+      break
+    end
+    local n = 0
+    for _ = 1, 64 do
+      n = (n << 1) | (IRS.Call(tN.irs_pd_bit) == 1 and 1 or 0)
+    end
+    p.nItems = p.nItems + 1
+    if nKind == 3 then
+      if p.tGroups[n] == nil and p.nGroups < 16 then
+        p.tGroups[n] = {nLast = -1, nSince = self.nClock}
+        p.nGroups = p.nGroups + 1
+      end
+    elseif not p.tGuestsSeen[n] and p.nGuestsSeen < 64 then
+      p.tGuestsSeen[n] = true
+      p.nGuestsSeen = p.nGuestsSeen + 1
+      local bOk, nGroup = pcall(tW.guests.GetGuestGroupID, tW.guests, n)
+      local nG = bOk and ToInteger(nGroup) or nil
+      self:PdNote({1, n, nG ~= nil and (nG + 1) or 0})
+    end
+  end
+  for nGroup, g in pairs(p.tGroups) do
+    local bOk, t = pcall(tW.guests.GetGroupDecisionState, tW.guests, nGroup)
+    local nCode = 0
+    if bOk and type(t) == "table" then
+      nCode = (c_tBehaviourIndex[t.sBehaviour] or 19) + 1
+    end
+    if nCode ~= g.nLast then
+      g.nLast = nCode
+      self:PdNote({2, nGroup, nCode})
+    end
+    if self.nClock - g.nSince > 600 then
+      p.tGroups[nGroup] = nil
+      p.nGroups = p.nGroups - 1
+    end
+  end
+  local bOk, nTrapped = pcall(tW.guests.GetTrappedGuestCount, tW.guests)
+  if bOk and nTrapped ~= p.nTrapped then
+    p.nTrapped = nTrapped
+    self:PdNote({4, ToIntegerOrZero(nTrapped)})
+  end
+  IRS.Call(tN.irs_pd_report)
+end
+
+IgnoreRideSafetyManager.GetPhysDiagLines = function(self)
+  local p = self.tPd
+  return {"DIAGNOSTIC: hooks " .. (self.tStatus.physdiag == IRS.ST_ON and "installed" or "off") .. "; ids received " .. S(p.nItems) ..
+    ", groups watched " .. S(p.nGroups) .. ", IncidentEnded messages " .. S(p.nMessages) .. ". Details in IgnoreRideSafety.log"}
 end
 
 -- PROTOTYPE ---------------------------------------------------------------
@@ -552,6 +686,16 @@ IgnoreRideSafetyManager.GetDiagnosticLines = function(self)
 end
 
 IgnoreRideSafetyManager.Advance = function(self, _nDeltaTime)
+  if self.tStatus.physdiag == IRS.ST_ON then
+    local nDtPd = api.time.GetDeltaTimeUnscaled() or 0
+    self.nClock = self.nClock + nDtPd
+    self.tPd.nTimer = self.tPd.nTimer + nDtPd
+    if self.tPd.nTimer >= c_nPdInterval then
+      self.tPd.nTimer = 0
+      pcall(self.PdTick, self)
+    end
+    return
+  end
   if self.tStatus.experimental ~= IRS.ST_ON then
     return
   end
@@ -579,7 +723,12 @@ end
 
 IgnoreRideSafetyManager.Shutdown = function(self)
   pcall(self.StopCrashObserver, self)
+  pcall(self.StopPdObserver, self)
   if self.tNative then
+    if self.tNative.bPhysDiag then
+      IRS.Call(self.tNative[IRS.tPhysDiag.sDisable])
+      IRS.Call(self.tNative.irs_pd_report)
+    end
     for _, sKind in ipairs(IRS.tOptionOrder) do
       IRS.Call(self.tNative[IRS.tOptions[sKind].sDisable])
     end
