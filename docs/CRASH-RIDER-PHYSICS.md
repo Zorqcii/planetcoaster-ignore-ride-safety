@@ -112,7 +112,7 @@ Static analysis only; no build, install or live test. exp.6 stays installed. The
 | Other entry paths (e.g. in protected code) | **Unknown** |
 Prototype status: **blocked** (owner decision, 2026-10-03). The stop condition is unchanged.
 
-### Bystander observation, session 1 (2026-10-03, about 22:50–23:10): protocol deviations, partial result
+### Bystander observation, session 1 (2026-10-03, about 22:50–23:10): **successful knockdown and recovery, observed with exp.6 enabled**
 **Conditions:** these differed from the proposal, and the result is weighed accordingly.
 * The owner's **main park** was used, not a disposable copy. It was not saved: no save file changed after 21:50 apart from Steam's
   `steam_autocloud.vdf` bookkeeping.
@@ -132,7 +132,8 @@ Prototype status: **blocked** (owner decision, 2026-10-03). The stop condition i
 * Internal messages: **no logged evidence.** exp.6's crash observer shows its counts only in the options menu, the game is now closed and
   they were not read, so no claim is made that `GuestPhysicsIncidentEnded` or any other message fired.
 
-**What this establishes:** in this game build, crash debris can knock down a bystander on foot, and that guest later recovers on their own.
+**Result (owner-confirmed classification): a successful bystander knockdown and recovery, observed with exp.6 enabled.** In this game
+build, crash debris knocked down a bystander on foot, and that guest later recovered on their own.
 This is consistent with the statically found contact → impact → enter-Physics → recovery path, but it **does not prove** that path was
 taken (no status line, no logging). Nothing here changes the "Unresolved" table. The prototype stays blocked.
 
