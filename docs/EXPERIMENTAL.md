@@ -120,6 +120,9 @@ records the fields of the first of each kind, and shows them plus the trapped-gu
 Question: in this crash type, do riders go through the physics-incident / SOS path, or are they moved straight to the exit?
 
 ## Milestone checkpoint: unfinished rides (0.2.0-exp.6, 2026-10-03)
+**Owner acceptance (2026-10-03): the installed 0.2.0-exp.6 package passed the manual checks** (crash/reset loop with the ride staying open,
+disabling the experimental option, and the safety and nausea options). The milestone is complete.
+
 The unfinished-ride objective is met: guests board an incomplete coaster and it dispatches repeatedly. When a train is destroyed,
 passengers return to the ride exit (not the crash site).
 

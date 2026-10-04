@@ -13,7 +13,8 @@ Addresses are for game build 1.13.3.88540.
 | 3. Whether that mechanism can safely work for seated passengers | **Not established**: no evidence either way |
 | Train-destruction code as a targeted route | **Not credible** with current evidence (see below) |
 
-Recommendation: keep the working crash loop (0.2.0-exp.6) with passengers returning to the exit as the completed experimental milestone.
+The working crash loop (0.2.0-exp.6, passengers return to the exit) is the completed milestone and stays as it is.
+Owner decision (2026-10-03): continue with one observation-only diagnostic round (plan below) before any behaviour prototype.
 
 ## Diagnostics: what the zero counts do and do not show
 The 0.2.0-exp.6 crash observer counted `GuestPhysicsIncidentEnded` 0, `GuestHidden` 0 and trapped guests 0 over several crashes with riders aboard.
@@ -24,13 +25,14 @@ The 0.2.0-exp.6 crash observer counted `GuestPhysicsIncidentEnded` 0, `GuestHidd
 * The counts are consistent with the owner's observation (riders reappear at the exit, nobody seen flying), and that observation is the stronger evidence.
 
 **Correction to the first version of this file.** It said the train-removed handler `0x1405d3fb0` purges the passengers (via `0x14081a0a0`,
-the routine behind `rides:PurgeAllRideGuests`), and called the zero count confirmed. The 0.2.0-exp.4/exp.5 logs contradict that this handler ran in
-these crashes. Its purge calls (`0x1405d403c`, `0x1405d4083`) are on one straight path to its `IsClosed` call (`0x1405d40aa`), which exp.4/exp.5
-hooked, yet across 18 crash closes:
-* the hook never reported "kept a listed ride open" (exp.5 listed both the station id and the ride id);
-* no close request came from the handler's own close call (only from the close-all routine `0x140815460`, called by the crash handler).
-Possible explanations: the handler is not called for this crash type, or its early exit (`+0x439`/`+0x438` flags → `0x1405d4199`) skips the purge,
-or the id it checks is of a type the list did not contain. **Which code moves the riders to the exit in this crash type is unidentified.**
+the routine behind `rides:PurgeAllRideGuests`), and called the zero count confirmed. That was a static reading, not an observation.
+A later revision said the exp.4/exp.5 logs contradict it. That was also too strong: the earlier hook was **inconclusive**.
+* Address: validated (fingerprints and original bytes checked before patching).
+* Installation: validated indirectly (all sites are applied all-or-nothing, and another site of the same batch demonstrably worked).
+* Coverage: **not validated.** The hook replaced only the handler's `IsClosed` call (`0x1405d40aa`), which comes after a branch
+  (`+0x439`/`+0x438` flags), and it counted only ids on the Lua list. The id the handler passes (`[train+0x160]`) was never shown to be
+  of the same kind as the listed station or ride ids. The close-request log was filtered the same way.
+So whether that handler (and its purge) runs in these crashes is **unknown**. **Which code moves the riders to the exit is unidentified.**
 
 ## 1. The existing physics / recovery system (found)
 * Per-tick guest-physics update `0x14067de10` (readable). It ends incidents (sends `GuestPhysicsIncidentEnded` via `0x1406f0860`),
@@ -62,7 +64,38 @@ or the id it checks is of a type the list did not contain. **Which code moves th
 * Calling it after the riders reach the exit is plausible but only launches them from the exit; that is not the requested behaviour.
 * Passenger ids are available (seat occupants, `rides:GetGuestsOnRide`). Crash position is plausibly available; crash velocity is not established.
 
-## Smallest next experiment (only if this is revisited; not built)
+## Diagnostic round 1 plan (observation only)
+Owner report (2026-10-03): the exp.6 milestone checks all passed (crash/reset loop, disabling the experimental option, safety and
+nausea options). Objective unchanged: passenger physics at the crash site.
+
+Three routines, each observed by an **unfiltered entry hook** (every call is recorded, whatever the ids), with return address,
+time, thread and the ids each routine itself reads at entry:
+
+| Routine | Why it is relevant | What its results distinguish |
+|---|---|---|
+| Train-removed handler `0x1405d3fb0` | Static candidate for crashed-train cleanup; contains two purge calls | Called at the crash or not; which caller; early-exit flags (`+0x438/+0x439`) say whether it can reach its purge calls; the ids it uses (`[train+0x160]`, `[train+0x2e0]`) |
+| Purge `0x14081a0a0` (`rides:PurgeAllRideGuests`) | The only known routine that moves riders off a ride to the exit | Whether riders are moved by this routine at the crash, and from which caller (handler, script, or one of two unexplained callers `0x14081bb0f` / `0x140856a86`) |
+| Guest-physics start `0x14067d450` | The routine that makes a guest a flying physics body | Whether any guest enters physics at the crash; if so, whether the guest was a passenger of the listed ride or a bystander |
+
+Controls:
+* **Installation:** after enabling, all hook bytes are read back and the result is logged. Build checks cover the bytes after each hook.
+* **Positive control (known event):** the ride info panel's "move entrance"/"move exit" buttons call `rides:PurgeAllRideGuests`
+  (game script), which calls the purge routine from `0x14046c099`. Clicking one must produce a purge event with that caller.
+* **Crash anchor:** the existing crash-close hook (`0x140815460` called from the crash handler) records a timestamped event per crash.
+* **Riders:** every 3 s the scripts send the guest ids of riders on open untested rides (`rides:GetGuestsOnRide`), so a physics
+  start can be classed as passenger or not, and the log shows the rider count before and after the crash.
+
+Limits (stated before the test):
+* There is no known in-game event that starts guest physics, so the physics-start hook has no positive control. A zero count rests on the
+  read-back check and on the same hook mechanism working for the purge control.
+* Passenger matching assumes script guest ids equal the native guest ids. This holds for station ids (stage 1) but is not proven for guests.
+  A physics start that matches no rider is therefore ambiguous (bystander or id mismatch).
+* If neither the handler nor the purge runs at the crash, the code that moves riders stays unidentified. That is a blocker for this
+  route, and this round stops there.
+* A purge at the crash, followed by riders reaching the exit, is timing evidence. It is strong but not proof that it is the only mover.
+* Observation hooks run inside game code and can still cause crashes or slowdowns. This build is not risk-free.
+
+## Earlier proposal (superseded by the plan above)
 An **observe-only** helper build: log-only entry hooks on the purge routine `0x14081a0a0`, the train-removed handler `0x1405d3fb0` and the start
 routine `0x14067d450`, each recording its return address. During one crash on a copied park it would show which of them runs, which code moves
 riders to the exit, and whether any incident is started. It changes no behaviour, so detachment, exit unloading and recovery stay as the game
