@@ -90,15 +90,52 @@ Static analysis only; no build, install or live test. exp.6 stays installed. The
 * What removing the component tears down (rigid body, physics maps) is presumably the protected component handler's job. Not established.
 
 ### What this means
-* The game's own design launches **guests on foot** (and whole groups) on contact, and recovers them **as a group**.
-  Riders are never in an accepted behaviour. After the purge, the prototype's rider's group showed Lost/Idle, which is also not
-  accepted, so the game's own path would have refused it.
+* On **the entry path found here** (contact handler → impact event → two receivers → enter-Physics), the game launches **guests on
+  foot** (whole groups) and recovers them **as a group**. **On this path**, riders are excluded: OnRide and Queueing are not accepted
+  behaviours, and the prototype rider's group after the purge (Lost/Idle) would also have been refused. This exclusion applies only
+  to the path found. Other entry paths, for example in the protected code, are neither found nor ruled out.
 * The prototype bypassed all of this: it called the start routine directly without the group state, component or group-wide entry,
   and with an invented ID. That explains the stuck guest as well as the crash, though the stuck guest is an inference.
-* **Boundary reached:** the one remaining link (GuestPhysics component added → start routine and teardown on removal) is in the
-  excluded protected code. Everything else in the entry and recovery sequence is identified statically, with the uncertainties listed.
-* No live test was done. A game-native observation would be possible without any mod change (e.g. watching whether guests on a path
-  that crash debris reaches are launched), but it is not planned.
+* **Boundary reached:** the remaining links are in the excluded protected code or are not identified (see "Unresolved" below).
+* No live test was done.
+
+### Unresolved (each keeps the prototype blocked)
+| Item | Status |
+|---|---|
+| Entry checks: group record `+8`, `+9`; the reason-2 check `0x1406cdf90` with `record+0xd8`; source id vs system `+0x9a50` | Location known, **meaning not identified** |
+| Pairing of the update's group message (`0x14067ebd7`) with receiver `0x1406a8ed0` | **Inferred** from matching layout and the crash; the type registration is in protected code |
+| Pairing of the impact event and the group request with their receivers (`0x1406b58b0`, `0x1406a8bc0`) | **Inferred** from field layout and the shared prerequisites; type registration not read |
+| "GuestPhysics" component added → physics start routine (launch) | **Hidden** (protected caller `0x14408ee20`); the link is inferred from the identical data layout |
+| "GuestPhysics" component removed → teardown (rigid body, physics maps) | **Hidden**; not established |
+| Per-member condition before the group recovery message | Readable but **not analysed** |
+| Which bodies the three contact source checks accept | Readable but **not analysed** |
+| Other entry paths (e.g. in protected code) | **Unknown** |
+Prototype status: **blocked** (owner decision, 2026-10-03). The stop condition is unchanged.
+
+### Proposed observation-only test of normal bystander physics (proposal only, not run)
+Purpose: watch the game's **own** crash-to-bystander physics once, with no new code, to check the statically found path against reality.
+* **Setup (disposable copy of a park):** an unfinished coaster whose open track end points over a busy footpath (debris lands among
+  guests). The ride is **closed and in test mode**, which the base game allows and which crashes with no riders aboard. All mod options
+  stay **off**, so the game behaves as unmodded (exp.6 changes nothing while its options are off). Run 2–3 test crashes and watch the path.
+  Quit without saving.
+* **Instrumentation:** none needed for the core result. Visual observation plus the game's own guest info panel, which shows the
+  status "Physics" for a guest in that state. Optional and still without any new build: tick EXPERIMENTAL in exp.6 to use its existing
+  read-only crash observer (IncidentEnded count with guests involved, trapped count) in Options > Game. This also validates that observer
+  against a real incident. Ticking it applies exp.6's patches (the test-mode ride is not on its list) and its one-time station refresh.
+* **What it could establish:**
+  * whether crash debris launches bystanders in this game at all;
+  * whether whole groups go into physics together (the group-wide entry);
+  * whether launched guests recover (get up and walk on), roughly how long that takes, and whether any become trapped/SOS;
+  * whether the game's `GuestPhysicsIncidentEnded` message fires (optional observer).
+* **What it cannot establish:**
+  * the meaning of the unidentified entry checks;
+  * proof of the message pairing;
+  * the hidden launch/teardown behaviour;
+  * anything about riders.
+  A **negative** result is inconclusive: the debris may simply not touch any guest, or the source checks may not accept coaster cars.
+* **Optional later step (needs a new build, so not proposed now):** observation hooks on the contact handler, the two receivers and the
+  enter-Physics routine would show the call order and the group IDs and would test the pairing. That needs owner approval to build and install.
+* **Bounds:** one session of about 15 minutes, a disposable copy, at most 3 crashes. Stop on any instability.
 
 ## Diagnostics: what the zero counts do and do not show
 The 0.2.0-exp.6 crash observer counted `GuestPhysicsIncidentEnded` 0, `GuestHidden` 0 and trapped guests 0 over several crashes with riders aboard.
