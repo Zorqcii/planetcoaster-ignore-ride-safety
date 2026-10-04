@@ -67,7 +67,8 @@ __declspec(dllimport) DWORD __stdcall SetFilePointer(HANDLE, long, long *, DWORD
 __declspec(dllimport) BOOL __stdcall WriteFile(HANDLE, const void *, DWORD, DWORD *, void *);
 __declspec(dllimport) BOOL __stdcall CloseHandle(HANDLE);
 
-#define IRS_VERSION "0.2.0-exp.5 EXPERIMENTAL"
+#define IRS_VERSION "0.2.0-diag.1 DIAGNOSTIC"
+#define IRS_PACKAGE "0.2.0-diag.1"
 
 /* status codes returned to Lua */
 enum {
@@ -274,8 +275,8 @@ BOOL __stdcall DllMain(HANDLE inst, DWORD reason, void *reserved)
     if (reason == DLL_PROCESS_ATTACH) {
         g_self = inst;
         log_line(build_supported()
-                     ? "Ignore Ride Safety " IRS_VERSION ": loaded, supported game build 1.13.3.88540"
-                     : "Ignore Ride Safety " IRS_VERSION ": loaded, UNSUPPORTED game build or unexpected code - options disabled, nothing changed");
+                     ? "Ignore Ride Safety helper " IRS_VERSION " (package " IRS_PACKAGE "): loaded, supported game build 1.13.3.88540"
+                     : "Ignore Ride Safety helper " IRS_VERSION " (package " IRS_PACKAGE "): loaded, UNSUPPORTED game build or unexpected code - options disabled, nothing changed");
     }
     return 1;
 }

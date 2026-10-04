@@ -15,3 +15,5 @@ TlsGetValue
 TlsSetValue
 GetProcessHeap
 HeapAlloc
+GetTickCount64
+GetCurrentThreadId

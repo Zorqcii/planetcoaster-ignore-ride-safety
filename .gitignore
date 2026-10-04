@@ -25,3 +25,4 @@ __pycache__/
 *.key
 .DS_Store
 dist-experimental/
+dist-diagnostic/

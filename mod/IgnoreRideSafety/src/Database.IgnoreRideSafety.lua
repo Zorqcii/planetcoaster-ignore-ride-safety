@@ -12,7 +12,11 @@ local pcall = global.pcall
 local ipairs = global.ipairs
 local IgnoreRideSafety = module(...)
 
-IgnoreRideSafety.sVersion = "0.2.0-exp.6 EXPERIMENTAL"
+IgnoreRideSafety.sVersion = "0.2.0-diag.1 DIAGNOSTIC"
+-- Package and component versions (shown separately in the options header and the log).
+IgnoreRideSafety.sPackageVersion = "0.2.0-diag.1"
+IgnoreRideSafety.sScriptsVersion = "0.2.0-diag.1"
+IgnoreRideSafety.nExpectedHelperDiagBuild = 1
 
 -- Status codes returned by the native helper (see native/irs_patch.c)
 IgnoreRideSafety.ST_ON = 1
@@ -49,6 +53,24 @@ IgnoreRideSafety.tExperimental = {
   sToolTip = "Experimental. Lets untested or unfinished rides be opened; while such a ride is open, guests treat it as Excitement 8, Fear 8, Nausea 4, and it stays open after a crash. Untick to restore normal behaviour. Resets to off when a park is loaded."
 }
 IgnoreRideSafety.tExperimentalChannel = {"irs_exp_begin", "irs_exp_bit0", "irs_exp_bit1", "irs_exp_push", "irs_exp_commit", "irs_exp_report"}
+-- DIAGNOSTIC (observation only): optional; absent from non-diagnostic helpers.
+IgnoreRideSafety.tDiagnosticNames = {"irs_dx_build", "irs_dx_riders_commit", "irs_dx_report"}
+
+-- "package X (scripts Y, helper Z)" so a mixed installation is visible.
+function IgnoreRideSafety.GetVersionText()
+  local t = IgnoreRideSafety.tNative
+  local sHelper
+  if t == nil then
+    sHelper = "helper not loaded"
+  elseif t.nHelperDiagBuild == IgnoreRideSafety.nExpectedHelperDiagBuild then
+    sHelper = "helper diag." .. tostring(t.nHelperDiagBuild)
+  elseif t.nHelperDiagBuild ~= nil then
+    sHelper = "helper diag." .. tostring(t.nHelperDiagBuild) .. " MISMATCH"
+  else
+    sHelper = "helper is NOT the diagnostic build"
+  end
+  return IgnoreRideSafety.sPackageVersion .. " DIAGNOSTIC (scripts " .. IgnoreRideSafety.sScriptsVersion .. ", " .. sHelper .. ")"
+end
 
 local function GetDLLPath()
   -- package.cpath begins with "<game dir>\?.dll"
@@ -115,6 +137,17 @@ function IgnoreRideSafety.LoadNative()
     end
   end
   tNative.bExperimental = bExp
+  local bDiag = bExp
+  for _, sName in ipairs(IgnoreRideSafety.tDiagnosticNames) do
+    local fn = package.loadlib(sPath, sName)
+    if fn == nil then
+      bDiag = false
+    else
+      tNative[sName] = fn
+    end
+  end
+  tNative.bDiagnostic = bDiag
+  tNative.nHelperDiagBuild = bDiag and Call(tNative.irs_dx_build) or nil
   IgnoreRideSafety.tNative = tNative
   return tNative
 end
@@ -181,7 +214,7 @@ function IgnoreRideSafety.InstallOptionsHook()
       local bAvailable = IgnoreRideSafety.IsAvailable()
       tItems[#tItems + 1] = {
         id = "game.ignoreridesafetyheader",
-        label = UIText("Mod: Ignore Ride Safety " .. IgnoreRideSafety.sVersion),
+        label = UIText("Mod: Ignore Ride Safety " .. IgnoreRideSafety.GetVersionText()),
         itemRendererClass = OptionsMenuGUI.LABEL
       }
       for _, sKind in ipairs(tOrder) do

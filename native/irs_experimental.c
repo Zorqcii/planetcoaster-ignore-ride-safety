@@ -25,6 +25,8 @@
  *     The game's record is never written. [rbp-0x40], from which the evaluator takes the chosen
  *     destination it returns, still holds the original record, so the copy never escapes. Only eax
  *     (as before) and, for listed rides, r12 are changed.
+ *
+ *  DIAGNOSTIC build (0.2.0-diag.1): sites 7-9 are observation-only entry hooks (see irs_diag.c).
  */
 
 __declspec(dllimport) void *__stdcall VirtualAlloc(void *, uintptr_t, DWORD, DWORD);
@@ -33,6 +35,16 @@ __declspec(dllimport) void *__stdcall TlsGetValue(DWORD);
 __declspec(dllimport) BOOL __stdcall TlsSetValue(DWORD, void *);
 __declspec(dllimport) HANDLE __stdcall GetProcessHeap(void);
 __declspec(dllimport) void *__stdcall HeapAlloc(HANDLE, DWORD, uintptr_t);
+
+/* diagnostic round 1 (irs_diag.c, included at the end) */
+static void dx_event(uint32_t kind, uint64_t ret, uint64_t a, uint64_t b, uint64_t c);
+static void dx_log_installed(void);
+void dx_hook_train(void);
+void dx_hook_purge(void);
+void dx_hook_physics(void);
+extern void *g_dx_tramp_train;
+extern void *g_dx_tramp_purge;
+extern void *g_dx_tramp_physics;
 
 /* No C runtime: required symbol when floating point is used. */
 int _fltused = 0;
@@ -61,8 +73,15 @@ static struct xsite g_exp_sites[] = {
     {0x140537510ULL, 5, {0x48, 0x89, 0x74, 0x24, 0x18}, {0}},
     /* 6: close-all-stations-of-a-ride 0x140815460 entry: mov rax,rsp ; mov [rax+0x10],rbx -> jmp stub5 ; 2-byte nop */
     {0x140815460ULL, 7, {0x48, 0x8b, 0xc4, 0x48, 0x89, 0x58, 0x10}, {0}},
+    /* DIAGNOSTIC, observation only: */
+    /* 7: train-removed handler 0x1405d3fb0 entry: mov [rsp+0x10],rbx -> jmp stub6 */
+    {0x1405d3fb0ULL, 5, {0x48, 0x89, 0x5c, 0x24, 0x10}, {0}},
+    /* 8: purge 0x14081a0a0 entry: mov rax,rsp ; push rbp ; push rbx -> jmp stub7 */
+    {0x14081a0a0ULL, 5, {0x48, 0x8b, 0xc4, 0x55, 0x53}, {0}},
+    /* 9: guest-physics start 0x14067d450 entry: mov [rsp+0x20],r9 -> jmp stub8 */
+    {0x14067d450ULL, 5, {0x4c, 0x89, 0x4c, 0x24, 0x20}, {0}},
 };
-#define EXP_NSITES 7
+#define EXP_NSITES 10
 
 static const struct fp g_exp_fps[] = {
     /* open gate: mov ecx,[rdi+0xc] ; test al,al ; jne ; test ecx,ecx ; (je) ; mov eax,[rdi+0x10] */
@@ -90,6 +109,23 @@ static const struct fp g_exp_fps[] = {
                           0x40, 0xe8, 0x15, 0xc1, 0xe6, 0xff, 0xeb, 0x2f}},
     /* join check B: mov rax,[rbp+0x260] ; mov eax,[rax+0x64] ; and eax,0xd ; cmp al,0xd  (record = 5th arg) */
     {0x1406a35b2ULL, 15, {0x48, 0x8b, 0x85, 0x60, 0x02, 0x00, 0x00, 0x8b, 0x40, 0x64, 0x83, 0xe0, 0x0d, 0x3c, 0x0d}},
+    /* DIAGNOSTIC: train-removed handler after its entry, and the fields the hook reads (+0x438/+0x439, train +0x2e0/+0x160) */
+    {0x1405d3fb5ULL, 24, {0x48, 0x89, 0x74, 0x24, 0x18, 0x55, 0x57, 0x41, 0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0x6c,
+                          0x24, 0xc9, 0x48, 0x81, 0xec, 0x90, 0x00, 0x00}},
+    {0x1405d3fceULL, 7, {0x80, 0xb9, 0x39, 0x04, 0x00, 0x00, 0x00}},
+    {0x1405d3fe4ULL, 7, {0x80, 0xb9, 0x38, 0x04, 0x00, 0x00, 0x00}},
+    {0x1405d4019ULL, 7, {0x48, 0x8b, 0x88, 0xe0, 0x02, 0x00, 0x00}},
+    {0x1405d4098ULL, 7, {0x48, 0x8b, 0x88, 0x60, 0x01, 0x00, 0x00}},
+    /* purge after its entry; it reads the id vector's data (+0x18) and count (+0x10) */
+    {0x14081a0a5ULL, 24, {0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xa8, 0x18, 0xfd, 0xff,
+                          0xff, 0x48, 0x81, 0xec, 0xa8, 0x03, 0x00, 0x00}},
+    {0x14081a0bdULL, 4, {0x48, 0x8b, 0x72, 0x18}},
+    {0x14081a0faULL, 4, {0x48, 0x8b, 0x42, 0x10}},
+    /* guest-physics start after its entry: pushes ; sub rsp,0x48 ; mov r12,rdx ; mov rbp,rcx ; ... mov rbx,r8 ; mov edx,[rbx] */
+    {0x14067d455ULL, 22, {0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 0x48,
+                          0x4c, 0x8b, 0xe2, 0x48, 0x8b, 0xe9}},
+    {0x14067d475ULL, 3, {0x49, 0x8b, 0xd8}},
+    {0x14067d48fULL, 2, {0x8b, 0x13}},
 };
 
 static int g_exp_supported = -1;
@@ -114,8 +150,9 @@ static int exp_supported(void)
 
 /* ---- ride list from Lua (one-way channel) -------------------------------------------------- */
 #define EXP_MAX_IDS 64
+#define EXP_MAX_PENDING 128        /* the channel also carries rider ids (diagnostic build) */
 static uint64_t g_exp_acc;
-static uint64_t g_exp_pending[EXP_MAX_IDS];
+static uint64_t g_exp_pending[EXP_MAX_PENDING];
 static int g_exp_npending;
 /* active list, double-buffered: Lua (one thread) fills the inactive buffer, then flips g_exp_cur;
  * guest threads read the current buffer. */
@@ -357,7 +394,9 @@ static volatile long g_exp_crashclose_skipped;
 
 int exp_skip_crash_close(uint64_t ride_id)
 {
-    if (g_exp_state && exp_listed(ride_id)) {
+    int listed = exp_listed(ride_id);
+    dx_event(1 /* DX_CRASHCLOSE */, EXP_CRASH_CLOSE_RETURN, ride_id, (uint64_t)listed, 0);
+    if (g_exp_state && listed) {
         __sync_fetch_and_add(&g_exp_crashclose_skipped, 1);
         return 1;
     }
@@ -406,7 +445,10 @@ static uint32_t rel32(uint64_t site, uint64_t target, int *ok)
  *         +0x80 trampoline B: original 5 prologue bytes of 0x1406a3470, then jmp 0x1406a3475 ;
  *         +0xa0 stub3 -> exp_isclosed ; +0xc0 stub4 -> exp_close_hook ;
  *         +0xe0 trampoline C: original 5 bytes of 0x140537510, then jmp 0x140537515 ;
- *         +0x100 stub5 -> exp_closeall_hook ; +0x120 trampoline D: original 7 bytes of 0x140815460, then jmp 0x140815467. */
+ *         +0x100 stub5 -> exp_closeall_hook ; +0x120 trampoline D: original 7 bytes of 0x140815460, then jmp 0x140815467 ;
+ *         DIAGNOSTIC: +0x140 stub6 -> dx_hook_train ; +0x160 trampoline E (0x1405d3fb0, 5 bytes) ;
+ *         +0x180 stub7 -> dx_hook_purge ; +0x1a0 trampoline F (0x14081a0a0, 5 bytes) ;
+ *         +0x1c0 stub8 -> dx_hook_physics ; +0x1e0 trampoline G (0x14067d450, 5 bytes). */
 static int exp_prepare_stub(void)
 {
     if (g_exp_stub) return 1;
@@ -430,7 +472,15 @@ static int exp_prepare_stub(void)
     put_abs_jmp(page + 0x100, (uint64_t)(uintptr_t)&exp_closeall_hook);
     for (int i = 0; i < 7; i++) page[0x120 + i] = g_exp_sites[6].orig[i];
     put_abs_jmp(page + 0x127, 0x140815467ULL);
-    FlushInstructionCache(GetCurrentProcess(), page, 0x140);
+    static const struct { int stub; void (*fn)(void); int site; } dx[3] = {
+        {0x140, dx_hook_train, 7}, {0x180, dx_hook_purge, 8}, {0x1c0, dx_hook_physics, 9}};
+    for (int k = 0; k < 3; k++) {
+        const struct xsite *x = &g_exp_sites[dx[k].site];
+        put_abs_jmp(page + dx[k].stub, (uint64_t)(uintptr_t)dx[k].fn);
+        for (int i = 0; i < x->n; i++) page[dx[k].stub + 0x20 + i] = x->orig[i];
+        put_abs_jmp(page + dx[k].stub + 0x20 + x->n, x->va + (uint64_t)x->n);
+    }
+    FlushInstructionCache(GetCurrentProcess(), page, 0x200);
     int ok = 1;
     uint32_t r;
     r = rel32(g_exp_sites[1].va, (uint64_t)(uintptr_t)(page + 0x00), &ok);   /* call stub0 */
@@ -455,6 +505,15 @@ static int exp_prepare_stub(void)
     for (int i = 0; i < 4; i++) g_exp_sites[6].patch[1 + i] = (uint8_t)(r >> (8 * i));
     g_exp_sites[6].patch[5] = 0x66; g_exp_sites[6].patch[6] = 0x90;
     g_exp_closeall_tramp = page + 0x120;
+    for (int k = 0; k < 3; k++) {                                               /* jmp stub6..8 */
+        struct xsite *x = &g_exp_sites[dx[k].site];
+        r = rel32(x->va, (uint64_t)(uintptr_t)(page + dx[k].stub), &ok);
+        x->patch[0] = 0xe9;
+        for (int i = 0; i < 4; i++) x->patch[1 + i] = (uint8_t)(r >> (8 * i));
+    }
+    g_dx_tramp_train = page + 0x160;
+    g_dx_tramp_purge = page + 0x1a0;
+    g_dx_tramp_physics = page + 0x1e0;
     if (!ok) { log_line("experimental: stub out of range"); return 0; }
     g_exp_join_tramp_a = page + 0x60;
     g_exp_join_tramp_b = page + 0x80;
@@ -507,6 +566,7 @@ static int exp_set(int on)
     g_exp_state = on;
     log_line(on ? "experimental: ON (untested/unfinished rides may open; listed open rides are treated as rated by guests)"
                 : "experimental: OFF (original code restored)");
+    if (on) dx_log_installed();
     return on ? ST_ON : ST_OFF;
 }
 
@@ -538,13 +598,14 @@ __declspec(dllexport) int irs_exp_bit1(void *L) { (void)L; g_exp_acc = (g_exp_ac
 __declspec(dllexport) int irs_exp_push(void *L)
 {
     (void)L;
-    if (g_exp_npending < EXP_MAX_IDS) g_exp_pending[g_exp_npending++] = g_exp_acc;
+    if (g_exp_npending < EXP_MAX_PENDING) g_exp_pending[g_exp_npending++] = g_exp_acc;
     g_exp_acc = 0;
     return 1;
 }
 __declspec(dllexport) int irs_exp_commit(void *L)
 {
     (void)L;
+    if (g_exp_npending > EXP_MAX_IDS) g_exp_npending = EXP_MAX_IDS;
     int changed = g_exp_npending != g_exp_nactive;
     for (int i = 0; !changed && i < g_exp_npending; i++) changed = g_exp_pending[i] != g_exp_active[i];
     for (int i = 0; i < g_exp_npending; i++) g_exp_active[i] = g_exp_pending[i];
@@ -613,3 +674,6 @@ __declspec(dllexport) int irs_exp_report(void *L)
     }
     return matched ? 1 : 2;
 }
+
+/* DIAGNOSTIC round 1: observation-only hooks (sites 7-9) and their report. */
+#include "irs_diag.c"

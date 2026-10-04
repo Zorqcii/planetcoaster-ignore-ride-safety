@@ -135,6 +135,51 @@ IgnoreRideSafetyManager.SendIds = function(self, _tIds)
   IRS.Call(tN.irs_exp_commit)
 end
 
+-- DIAGNOSTIC: guest ids of riders (GetGuestsOnRide returns an array of native 64-bit ids).
+local function RiderIds(tW, rideID, tOut)
+  local bOk, tGuests = pcall(tW.rides.GetGuestsOnRide, tW.rides, rideID)
+  local nFound = 0
+  if bOk and type(tGuests) == "table" then
+    for _, v in pairs(tGuests) do
+      nFound = nFound + 1
+      local n = ToInteger(v)
+      if n ~= nil and #tOut < 127 then
+        tOut[#tOut + 1] = n
+      end
+    end
+  end
+  return nFound
+end
+
+-- DIAGNOSTIC: sends rider ids over the same channel; the first value is a marker carrying the
+-- number of riders the script found (bit 62 set), so the log shows ids that could not be sent.
+IgnoreRideSafetyManager.SendRiders = function(self, _tIds, _nFound)
+  local tN = self.tNative
+  if not tN.bDiagnostic then
+    return
+  end
+  local tAll = {(1 << 62) | _nFound}
+  for _, n in ipairs(_tIds) do
+    tAll[#tAll + 1] = n
+  end
+  IRS.Call(tN.irs_exp_begin)
+  for _, nId in ipairs(tAll) do
+    local nHigh = 63
+    while nHigh > 0 and ((nId >> nHigh) & 1) == 0 do
+      nHigh = nHigh - 1
+    end
+    for b = nHigh, 0, -1 do
+      if ((nId >> b) & 1) == 1 then
+        IRS.Call(tN.irs_exp_bit1)
+      else
+        IRS.Call(tN.irs_exp_bit0)
+      end
+    end
+    IRS.Call(tN.irs_exp_push)
+  end
+  IRS.Call(tN.irs_dx_riders_commit)
+end
+
 local function CountGuestsOnRide(tW, rideID)
   local bOk, tGuests = pcall(tW.rides.GetGuestsOnRide, tW.rides, rideID)
   local n = 0
@@ -153,6 +198,8 @@ IgnoreRideSafetyManager.UpdateExperimental = function(self)
   local nUntestedThought = guestsAPI.GuestThoughtType_Assessment_RideUntested
   local tTokens = tW.ridestation:GetAllRideStationEditTokens()
   local tIds = {}
+  local tRiders = {}
+  local nRidersFound = 0
   local tLines = {}
   for i = 1, #tTokens do
     local st = tW.ridestation:GetRideStationEntityIDFromEditToken(tTokens[i])
@@ -167,6 +214,7 @@ IgnoreRideSafetyManager.UpdateExperimental = function(self)
         if nRideId ~= nil and nRideId ~= nId then
           tIds[#tIds + 1] = nRideId
         end
+        nRidersFound = nRidersFound + RiderIds(tW, rideID, tRiders)
       end
       local sState = tW.attractions:IsOpen(st) and "open" or (tW.attractions:IsTesting(st) and "testing" or "closed")
       local nFree = "?"
@@ -193,12 +241,18 @@ IgnoreRideSafetyManager.UpdateExperimental = function(self)
     end
   end
   self:SendIds(tIds)
+  self:SendRiders(tRiders, nRidersFound)
   local nReport = IRS.Call(self.tNative.irs_exp_report)
+  if self.tNative.bDiagnostic then
+    IRS.Call(self.tNative.irs_dx_report)
+  end
   if nReport == 1 then
     self.bGuestIdMatch = true
   elseif self.bGuestIdMatch == nil and nReport == 2 then
     self.bGuestIdMatch = false
   end
+  tLines[#tLines + 1] = "DIAGNOSTIC: " .. (self.tNative.bDiagnostic and "observation hooks active while this option is on; results in IgnoreRideSafety.log" or "helper has no diagnostics") ..
+    ". Riders on open untested rides: " .. nRidersFound .. " (ids sent " .. #tRiders .. ")"
   tLines[#tLines + 1] = "Open untested rides given assumed ratings: " .. #tIds .. ". Guest code reached one of them: " ..
     (self.bGuestIdMatch == true and "YES" or (self.bGuestIdMatch == false and "not yet" or "-"))
   self.tDiag = tLines

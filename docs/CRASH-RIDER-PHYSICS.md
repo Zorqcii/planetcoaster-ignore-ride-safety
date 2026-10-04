@@ -88,12 +88,35 @@ Controls:
 Limits (stated before the test):
 * There is no known in-game event that starts guest physics, so the physics-start hook has no positive control. A zero count rests on the
   read-back check and on the same hook mechanism working for the purge control.
-* Passenger matching assumes script guest ids equal the native guest ids. This holds for station ids (stage 1) but is not proven for guests.
-  A physics start that matches no rider is therefore ambiguous (bystander or id mismatch).
+* Passenger matching compares the physics routine's guest id with the ids from `rides:GetGuestsOnRide`. That binding pushes the game's own
+  64-bit ids as integers (static reading of `0x140464d10`/`0x1403a4ad0`), so both sides should be the same kind of id, but this has not
+  been observed in game. A physics start that matches no rider is therefore still ambiguous (bystander, rider of another ride, or id mismatch).
 * If neither the handler nor the purge runs at the crash, the code that moves riders stays unidentified. That is a blocker for this
   route, and this round stops there.
 * A purge at the crash, followed by riders reaching the exit, is timing evidence. It is strong but not proof that it is the only mover.
 * Observation hooks run inside game code and can still cause crashes or slowdowns. This build is not risk-free.
+
+## Diagnostic build 0.2.0-diag.1 (built, not yet tested)
+Package `IgnoreRideSafety-DIAGNOSTIC-0.2.0-diag.1.zip` (built by `tools/make_diagnostic.sh`; not published). Behaviour is that of
+0.2.0-exp.6. Added only while the EXPERIMENTAL option is on:
+* entry hooks at `0x1405d3fb0`, `0x14081a0a0`, `0x14067d450` (sites 7-9, `native/irs_diag.c`). Each saves the argument registers,
+  reads the fields named above, writes one event to a 256-entry ring buffer and continues into the original code. No logging and no
+  allocation inside a hook. The log is written from the script thread every 3 s (at most 48 event lines per report, 3000 in total;
+  dropped or lost events are counted);
+* a crash anchor event in the existing crash-close hook;
+* rider ids for open untested rides (with a marker giving the number of riders the script found), every 3 s.
+Build checks: the 10 sites plus 24 fingerprints, verified against the executable. Hooks are applied all-or-nothing and read back
+after enabling ("diag: observation hooks installed and read back OK").
+Version labels: package / scripts / helper each say 0.2.0-diag.1. The options header shows
+"0.2.0-diag.1 DIAGNOSTIC (scripts 0.2.0-diag.1, helper diag.1)" and flags a mismatching helper.
+`IgnoreRideSafety/PACKAGE-VERSION.txt` lists all three. `tools/dev/switch-install.sh --status` prints package and helper separately,
+and the switch saves the installed log before replacing the folder.
+
+Log lines to read after the test:
+* `diag: observation hooks installed and read back OK` (installation);
+* `PURGE from 0x14046c09e (script rides:PurgeAllRideGuests (positive control))` (known-event control, with the ride's id);
+* around each `CRASH-CLOSE ... listed`: any `TRAIN-REMOVED`, `PURGE` and `PHYSICS-START` events, their callers and times;
+* `riders on open untested rides: N` before and after the crash.
 
 ## Earlier proposal (superseded by the plan above)
 An **observe-only** helper build: log-only entry hooks on the purge routine `0x14081a0a0`, the train-removed handler `0x1405d3fb0` and the start
