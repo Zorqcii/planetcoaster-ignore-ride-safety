@@ -15,15 +15,14 @@
  *   REDIRECT sites: a `jmp rel32` / `call rel32` to the observed routine is re-targeted to the stub;
  *                 the wrapper then jumps to the original target.
  *
- * Read policy (hook bodies): a hook body reads only
- *   (a) values in argument registers;
- *   (b) memory on the CURRENT thread's stack (checked at run time against the thread's stack bounds);
- *   (c) game memory that the observed routine itself reads on this call before any call, lock or
- *       other synchronisation (verified offline per read), so the read happens under the same
- *       conditions as the game's own unsynchronised read.
- * Nothing else is read natively. Confirmed state (displayed behaviour, group members, messages) is
- * taken by the scripts through the game's public script functions on the script thread.
- *
+ * Read policy (hook bodies, revision 3): a hook body reads only
+ *   (a) values in registers, and
+ *   (b) memory that belongs to the CURRENT thread: its own stack (checked at run time against the
+ *       thread's stack bounds) and, for the two patched purge calls, the id buffer owned by the
+ *       caller's stack-local vector (the caller allocates it before and frees it after the call).
+ * No shared game object (records, maps, messages) is read natively: their lifetime/synchronisation
+ * during the hook is not established. Confirmed state (displayed behaviour, group members,
+ * messages) is taken by the scripts through the game's public script functions.
  * Log labels: ENTRY = a routine was entered (values as read at entry, outcomes are predictions);
  * STATE = a confirmed change, from the scripts; SANITY = purge (unloading) calls from the script
  * binding and the station purge only - the crash-time purge call is not observable here.
@@ -78,7 +77,7 @@ static struct pdsite g_pd_sites[PD_NSITES] = {
 static const struct fp g_pd_fps[] = {
     /* P1 dispatcher stub: mov rcx,[rcx+8] (then jmp impact receiver = site) */
     {0x1406f1fa0ULL, 4, {0x48, 0x8b, 0x49, 0x08}},
-    /* impact receiver: entry .. message 0 checks and pending-map lookup (reads mirrored by P1, all before its first call) */
+    /* impact receiver: entry .. message 0 checks and pending-map lookup (code checked, not read) */
     {0x1406b58b0ULL, 24, {0x4c, 0x8b, 0xdc, 0x53, 0x41, 0x54, 0x41, 0x57, 0x48, 0x83, 0xec, 0x60, 0x48, 0x8b, 0x5a, 0x10, 0x4c, 0x8b, 0xf9, 0x48, 0x8b, 0x42, 0x08, 0x45}},
     {0x1406b58c8ULL, 24, {0x33, 0xe4, 0x48, 0x8d, 0x04, 0xc3, 0x48, 0x8b, 0xc8, 0x48, 0x2b, 0xcb, 0x48, 0x83, 0xc1, 0x07, 0x48, 0xc1, 0xe9, 0x03, 0x48, 0x3b, 0xd8, 0x49}},
     {0x1406b58e0ULL, 24, {0x0f, 0x47, 0xcc, 0x48, 0x89, 0x4c, 0x24, 0x30, 0x48, 0x85, 0xc9, 0x0f, 0x84, 0x3e, 0x02, 0x00, 0x00, 0x49, 0x89, 0x73, 0xe0, 0x41, 0xb9, 0x42}},
@@ -105,7 +104,7 @@ static const struct fp g_pd_fps[] = {
     {0x1406f0a1dULL, 18, {0x89, 0x44, 0x24, 0x30, 0x49, 0x8b, 0xd9, 0x49, 0x8b, 0xf8, 0xe8, 0x04, 0xd1, 0x9d, 0xff, 0x48, 0x8b, 0x08}},
     /* P3 dispatcher stub: mov rcx,[rcx+8] (then jmp request receiver = site) */
     {0x1406f2630ULL, 4, {0x48, 0x8b, 0x49, 0x08}},
-    /* request receiver: entry .. message 0 checks (reads mirrored by P3, all before its first call) */
+    /* request receiver: entry .. message 0 checks (code checked, not read) */
     {0x1406a8bc0ULL, 24, {0x40, 0x53, 0x56, 0x57, 0x41, 0x56, 0x48, 0x83, 0xec, 0x38, 0x48, 0x8b, 0x5a, 0x10, 0x33, 0xff, 0x48, 0x8b, 0x42, 0x08, 0x48, 0x8b, 0xf1, 0x48}},
     {0x1406a8bd8ULL, 24, {0x8d, 0x04, 0xc3, 0x4c, 0x8b, 0xf0, 0x4c, 0x2b, 0xf3, 0x49, 0x83, 0xc6, 0x07, 0x49, 0xc1, 0xee, 0x03, 0x48, 0x3b, 0xd8, 0x4c, 0x0f, 0x47, 0xf7}},
     {0x1406a8bf0ULL, 24, {0x4d, 0x85, 0xf6, 0x0f, 0x84, 0xc8, 0x00, 0x00, 0x00, 0x48, 0x89, 0x6c, 0x24, 0x60, 0x4c, 0x89, 0x64, 0x24, 0x70, 0x41, 0xbc, 0x42, 0x11, 0x00}},
@@ -127,7 +126,7 @@ static const struct fp g_pd_fps[] = {
     {0x14067fcb9ULL, 1, {0x00}},
     /* P6 dispatcher stub: mov rcx,[rcx+8] (then jmp recovery receiver = site) */
     {0x1406f2590ULL, 4, {0x48, 0x8b, 0x49, 0x08}},
-    /* recovery receiver: entry .. call exit-behaviour (reads mirrored by P6) */
+    /* recovery receiver: entry .. call exit-behaviour (code checked, not read) */
     {0x1406a8ed0ULL, 24, {0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0x5a, 0x10}},
     {0x1406a8ee8ULL, 24, {0x33, 0xff, 0x48, 0x8b, 0x42, 0x08, 0x48, 0x8b, 0xe9, 0x48, 0x8d, 0x04, 0xc3, 0x48, 0x8b, 0xf0, 0x48, 0x2b, 0xf3, 0x48, 0x83, 0xc6, 0x07, 0x48}},
     {0x1406a8f00ULL, 24, {0xc1, 0xee, 0x03, 0x48, 0x3b, 0xd8, 0x48, 0x0f, 0x47, 0xf7, 0x48, 0x85, 0xf6, 0x74, 0x4a, 0x90, 0x48, 0x8b, 0x03, 0x8b, 0x40, 0x18, 0x4c, 0x69}},
@@ -222,94 +221,19 @@ static int pd_on_my_stack(uint64_t p, uint64_t size)
     return p >= limit && p + size <= base && p + size > p;
 }
 
-/* game hash lookups, read-only (fingerprinted; checked against the game's code in an emulator) */
-static const uint64_t *pd_find64(const uint64_t *m, uint64_t key)
-{
-    const uint64_t *buckets = (const uint64_t *)(uintptr_t)m[0];
-    uint64_t nb = m[1];
-    if (!buckets || !nb) return 0;
-    uint64_t h = (key << 18) + ~key;
-    h ^= h >> 31; h *= 21; h ^= h >> 11; h *= 65;
-    const uint64_t *slot = &buckets[((uint64_t)(uint32_t)(h >> 22) ^ (uint64_t)(uint32_t)h) % nb];
-    const uint64_t *node = (const uint64_t *)(uintptr_t)*slot;
-    for (int g = 0; node && node != slot && g < 100000; g++) {
-        if (node[1] == key) return node;
-        node = (const uint64_t *)(uintptr_t)node[0];
-    }
-    return 0;
-}
-static const uint64_t *pd_find32(const uint64_t *m, uint32_t key, int keyoff)
-{
-    const uint64_t *buckets = (const uint64_t *)(uintptr_t)m[0];
-    uint64_t nb = m[1];
-    if (!buckets || !nb) return 0;
-    uint32_t a = key * 0x1001u;
-    a ^= a >> 22; a *= 0x11u; a ^= a >> 9; a *= 0x401u; a ^= a >> 2; a *= 0x81u;
-    const uint64_t *slot = &buckets[((uint64_t)(a >> 12) ^ (uint64_t)a) % nb];
-    const uint64_t *node = (const uint64_t *)(uintptr_t)*slot;
-    for (int g = 0; node && node != slot && g < 100000; g++) {
-        if (*(const uint32_t *)((const uint8_t *)node + keyoff) == key) return node;
-        node = (const uint64_t *)(uintptr_t)node[0];
-    }
-    return 0;
-}
-
-static int pd_beh_ok(uint8_t beh) { return beh <= 0xc && ((0x1142u >> beh) & 1); }
-enum { PRED_REJECT = 0, PRED_ACCEPT = 1, PRED_EXTRA = 2, PRED_NA = 3 };
 #define NOTREAD 0xffffffffffffffffULL
 
-/* ---- hook bodies: regs [0]=r9 [1]=r8 [2]=rdx [3]=rcx [4]=return address [4+k]=[entry rsp + 8k] ----
- * Each body mirrors, in the same order, only the reads the observed routine makes on this call
- * before its first call or synchronisation (see the offline read-path check). Message lists: only
- * message 0 is examined (later messages are read by the game after calls). */
+/* ---- hook bodies: regs [0]=r9 [1]=r8 [2]=rdx [3]=rcx [4]=return address [4+k]=[entry rsp + 8k]
+ * (regs and the return address are on the current thread's stack: written by the wrapper / the call). */
 
-/* P1 impact receiver 0x1406b58b0 (rcx = system, rdx = message list) */
-void pd_b_impact(const uint64_t *r)
+/* message list header: read the count only if the list header is on this thread's stack */
+static uint64_t pd_list_count(uint64_t vec)
 {
-    uint64_t sys = r[3], vec = r[2];
-    uint64_t data = RD64(vec + 0x10), cnt = RD64(vec + 8);
-    if (!cnt) return;
-    uint64_t msg = RD64(data);
-    uint64_t guest = RD64(msg + 0x18);
-    uint64_t idx = NOTREAD, packed = (uint64_t)PRED_NA << 36, reason = NOTREAD, src = NOTREAD;
-    const uint64_t *node = pd_find64((const uint64_t *)(uintptr_t)(sys + 0x218), guest);
-    if (node) {
-        idx = RD32((uint64_t)(uintptr_t)node + 0x10);
-        packed = 1ULL << 38;                                   /* found */
-        if (RD64(RD64(sys + 0x288) + idx * 8) == guest) {
-            packed |= 1ULL << 39;                              /* per-group entry matches */
-            uint64_t gm = RD64(sys + 0x1d0);
-            uint64_t rec = RD64(gm + 0x3b8) + idx * 0x250;
-            uint8_t f8 = RD8(rec + 8), beh = 0, f9 = 0, d8 = 0;
-            int pred = PRED_REJECT, srcEq = 0, pend = 0;
-            if (f8) {
-                beh = RD8(rec + 0x1a);
-                if (pd_beh_ok(beh)) {
-                    f9 = RD8(rec + 9);
-                    if (f9) {
-                        reason = RD32(msg + 0x38);
-                        if (reason == 2) d8 = RD8(rec + 0xd8);
-                        if (reason == 2 && d8 == 1) {
-                            pred = PRED_EXTRA;                 /* the game calls 0x1406cdf90 here: stop reading */
-                        } else {
-                            src = RD64(msg + 0x40);
-                            srcEq = src == RD64(gm + 0x9a50);
-                            if (!srcEq) {
-                                if (RD64(sys + 0x250)) pend = pd_find32((const uint64_t *)(uintptr_t)(sys + 0x238), (uint32_t)idx, 8) ? 1 : 0;
-                                else pend = 2;
-                                pred = pend == 1 ? PRED_REJECT : PRED_ACCEPT;
-                            }
-                        }
-                    }
-                }
-            }
-            packed |= (uint64_t)f8 | ((uint64_t)f9 << 8) | ((uint64_t)beh << 16) | ((uint64_t)d8 << 24) |
-                      ((uint64_t)srcEq << 32) | ((uint64_t)pend << 33) | ((uint64_t)pred << 36);
-        }
-    }
-    pd_event(K_IMPACT, r[4], guest, idx, reason, src, packed | (cnt > 1 ? 1ULL << 40 : 0));
-    pd_item(2, guest);
+    return pd_on_my_stack(vec, 0x18) ? RD64(vec + 8) : NOTREAD;
 }
+
+/* P1 impact receiver 0x1406b58b0 (rdx = message list) */
+void pd_b_impact(const uint64_t *r) { pd_event(K_IMPACT, r[4], pd_list_count(r[2]), 0, 0, 0, 0); }
 
 /* P2 post group request 0x1406f0a00 (rdx = &group index on the caller's stack) */
 void pd_b_post(const uint64_t *r)
@@ -319,43 +243,16 @@ void pd_b_post(const uint64_t *r)
     if (idx != NOTREAD) pd_group_add(idx);
 }
 
-/* P3 request receiver 0x1406a8bc0 (rcx = guest manager, rdx = message list) */
-void pd_b_request(const uint64_t *r)
-{
-    uint64_t gm = r[3], vec = r[2];
-    uint64_t data = RD64(vec + 0x10), cnt = RD64(vec + 8);
-    if (!cnt) return;
-    uint64_t msg = RD64(data);
-    uint64_t idx = RD32(msg + 0x18), src = RD64(msg + 0x38);
-    uint64_t rec = RD64(gm + 0x3b8) + idx * 0x250;
-    uint8_t f8 = RD8(rec + 8), beh = 0, f9 = 0, d8 = 0;
-    uint64_t reason = NOTREAD;
-    int pred = PRED_REJECT, srcEq = 0;
-    if (f8) {
-        beh = RD8(rec + 0x1a);
-        if (pd_beh_ok(beh)) {
-            f9 = RD8(rec + 9);
-            if (f9) {
-                reason = RD32(msg + 0x1c);
-                if (reason == 2) d8 = RD8(rec + 0xd8);
-                if (reason == 2 && d8 == 1) pred = PRED_EXTRA;
-                else { srcEq = src == RD64(gm + 0x9a50); if (!srcEq) pred = PRED_ACCEPT; }
-            }
-        }
-    }
-    uint64_t packed = (uint64_t)f8 | ((uint64_t)f9 << 8) | ((uint64_t)beh << 16) | ((uint64_t)d8 << 24) |
-                      ((uint64_t)srcEq << 32) | ((uint64_t)pred << 36) | (cnt > 1 ? 1ULL << 40 : 0);
-    pd_event(K_REQUEST, r[4], idx, reason, src, 0, packed);
-    pd_group_add(idx);
-}
+/* P3 request receiver 0x1406a8bc0 (rdx = message list) */
+void pd_b_request(const uint64_t *r) { pd_event(K_REQUEST, r[4], pd_list_count(r[2]), 0, 0, 0, 0); }
 
-/* P4 physics start 0x14067d450 (rdx = &guest id, r8 = &{group key, ...}) */
+/* P4 physics start 0x14067d450 (rdx = &guest id, r8 = &{group key, ...}); only stack-resident values are read */
 void pd_b_launch(const uint64_t *r)
 {
-    uint64_t key = RD32(r[1]);                                /* first memory read of the routine's first callee */
     uint64_t guest = pd_on_my_stack(r[2], 8) ? RD64(r[2]) : NOTREAD;
+    uint64_t key = pd_on_my_stack(r[1], 4) ? RD32(r[1]) : NOTREAD;
     pd_event(K_LAUNCH, r[4], guest, key, 0, 0, 0);
-    pd_group_add(key);
+    if (key != NOTREAD) pd_group_add(key);
     if (guest != NOTREAD) pd_item(2, guest);
 }
 
@@ -367,24 +264,11 @@ void pd_b_sos(const uint64_t *r)
     if (guest != NOTREAD) pd_item(2, guest);
 }
 
-/* P6 recovery receiver 0x1406a8ed0 (rcx = guest manager, rdx = message list) */
-void pd_b_recover(const uint64_t *r)
-{
-    uint64_t gm = r[3], vec = r[2];
-    uint64_t data = RD64(vec + 0x10), cnt = RD64(vec + 8);
-    if (!cnt) return;
-    uint64_t msg = RD64(data);
-    uint64_t idx = RD32(msg + 0x18);
-    uint64_t rec = RD64(gm + 0x3b8) + idx * 0x250;
-    uint8_t beh = RD8(rec + 0x1a), f8 = 0, f9 = 0;
-    int proceed = 0;
-    if (beh == 0x0b) { f8 = RD8(rec + 8); if (f8) { f9 = RD8(rec + 9); proceed = f9 != 0; } }
-    pd_event(K_RECOVER, r[4], idx, beh, f8, f9, (uint64_t)proceed | (cnt > 1 ? 2 : 0));
-    pd_group_add(idx);
-}
+/* P6 recovery receiver 0x1406a8ed0 (rdx = message list) */
+void pd_b_recover(const uint64_t *r) { pd_event(K_RECOVER, r[4], pd_list_count(r[2]), 0, 0, 0, 0); }
 
-/* P7 exit behaviour 0x14069cec0 (rdx = &group index, r8 = group record); logged only when called by
- * enter-Physics or by the recovery receiver, or for a group already of interest */
+/* P7 exit behaviour 0x14069cec0 (rdx = &group index); logged when called by enter-Physics or the
+ * recovery receiver, or for a group already of interest. The group record (r8) is not read. */
 #define RET_FROM_ENTER   0x14069c8d1ULL
 #define RET_FROM_RECOVER 0x1406a8f4dULL
 void pd_b_exit(const uint64_t *r)
@@ -392,19 +276,20 @@ void pd_b_exit(const uint64_t *r)
     uint64_t idx = pd_on_my_stack(r[2], 4) ? RD32(r[2]) : NOTREAD;
     int interesting = r[4] == RET_FROM_ENTER || r[4] == RET_FROM_RECOVER || (idx != NOTREAD && pd_group_known(idx));
     if (!interesting) return;
-    uint64_t rec = r[1];
-    uint8_t f1b = RD8(rec + 0x1b);                           /* read by the routine first */
-    uint64_t handle = f1b ? RD64(rec + 0x50) : NOTREAD;      /* read next, only when +0x1b != 0 */
-    pd_event(K_EXIT, r[4], idx, f1b, handle, r[0] & 0xff, 0);
+    pd_event(K_EXIT, r[4], idx, r[0] & 0xff, 0, 0, 0);
     if (idx != NOTREAD) pd_group_add(idx);
 }
 
-/* P8/P9 purge 0x14081a0a0 via its callers (rdx = id vector) */
+/* P8/P9 purge 0x14081a0a0 via the two patched callers: rdx = their stack-local id vector, whose
+ * buffer the caller allocated just before the call and frees just after it */
 void pd_b_purge(const uint64_t *r)
 {
-    uint64_t v = r[2];
-    uint64_t data = RD64(v + 0x18), n = RD64(v + 0x10), first = 0;
-    if (n) first = RD64(data);
+    uint64_t v = r[2], n = NOTREAD, first = 0;
+    if (pd_on_my_stack(v, 0x20)) {
+        n = RD64(v + 0x10);
+        uint64_t data = RD64(v + 0x18);
+        if (n && n != NOTREAD && data) first = RD64(data);
+    }
     pd_event(K_PURGE, r[4], n, first, 0, 0, 0);
 }
 
@@ -637,17 +522,6 @@ static const char *pd_caller(uint64_t ret)
     }
 }
 static char *pd_val(char *p, uint64_t v) { return v == NOTREAD ? fmt_str(p, "(not read)") : fmt_u64(p, v); }
-static char *pd_checks(char *p, uint64_t e)
-{
-    static const char *pred[] = {"predicted REJECT", "predicted ACCEPT", "needs extra check 0x1406cdf90 (not evaluated; later checks not read)", "n/a"};
-    p = fmt_str(p, " checks: +8="); p = fmt_u64(p, e & 0xff);
-    p = fmt_str(p, " beh="); p = fmt_str(p, pd_beh_name((e >> 16) & 0xff));
-    p = fmt_str(p, " +9="); p = fmt_u64(p, (e >> 8) & 0xff);
-    p = fmt_str(p, " +0xd8="); p = fmt_u64(p, (e >> 24) & 0xff);
-    p = fmt_str(p, " src==+0x9a50:"); p = fmt_u64(p, (e >> 32) & 1);
-    p = fmt_str(p, " => "); p = fmt_str(p, pred[(e >> 36) & 3]);
-    return p;
-}
 
 static void pd_line(const struct pd_ev *v, uint64_t idx)
 {
@@ -656,51 +530,31 @@ static void pd_line(const struct pd_ev *v, uint64_t idx)
     p = fmt_str(p, " t="); p = fmt_u64(p, v->t - g_pd_t0); p = fmt_str(p, "ms tid="); p = fmt_u64(p, v->tid); *p++ = ' ';
     switch (v->kind) {
     case K_IMPACT:
-        p = fmt_str(p, "ENTRY impact-event(msg 0) guest="); p = fmt_u64(p, v->a);
-        if (v->b == NOTREAD) p = fmt_str(p, " grp=(not in guest->group map) => predicted REJECT");
-        else {
-            p = fmt_str(p, " grp="); p = fmt_u64(p, v->b);
-            if (!((v->e >> 39) & 1)) p = fmt_str(p, " => predicted REJECT (per-group entry mismatch)");
-            else {
-                p = fmt_str(p, " reason="); p = pd_val(p, v->c); p = fmt_str(p, " src="); p = v->d == NOTREAD ? fmt_str(p, "(not read)") : fmt_hex(p, v->d);
-                p = pd_checks(p, v->e);
-                uint64_t pend = (v->e >> 33) & 3;
-                p = fmt_str(p, pend == 1 ? " (request already pending)" : "");
-            }
-        }
-        if ((v->e >> 40) & 1) p = fmt_str(p, " [more messages in this batch: not examined]");
+        p = fmt_str(p, "ENTRY impact-receiver messages="); p = pd_val(p, v->a);
         break;
     case K_POST:
         p = fmt_str(p, "ENTRY post-group-request grp="); p = pd_val(p, v->a);
         break;
     case K_REQUEST:
-        p = fmt_str(p, "ENTRY request-receiver(msg 0) grp="); p = fmt_u64(p, v->a);
-        p = fmt_str(p, " reason="); p = pd_val(p, v->b); p = fmt_str(p, " src="); p = fmt_hex(p, v->c);
-        p = pd_checks(p, v->e);
-        if ((v->e >> 40) & 1) p = fmt_str(p, " [more messages in this batch: not examined]");
+        p = fmt_str(p, "ENTRY request-receiver messages="); p = pd_val(p, v->a);
         break;
     case K_LAUNCH:
-        p = fmt_str(p, "ENTRY physics-start guest="); p = pd_val(p, v->a); p = fmt_str(p, " key(grp)="); p = fmt_u64(p, v->b);
-        if (v->a == NOTREAD) p = fmt_str(p, " (guest id pointer not on this thread's stack: not read)");
+        p = fmt_str(p, "ENTRY physics-start guest="); p = pd_val(p, v->a); p = fmt_str(p, " key(grp)="); p = pd_val(p, v->b);
         break;
     case K_SOS:
         p = fmt_str(p, "ENTRY SOS-step guest="); p = pd_val(p, v->a);
         break;
     case K_RECOVER:
-        p = fmt_str(p, "ENTRY recovery-receiver(msg 0) grp="); p = fmt_u64(p, v->a);
-        p = fmt_str(p, " beh="); p = fmt_str(p, pd_beh_name(v->b));
-        p = fmt_str(p, " +8="); p = fmt_u64(p, v->c); p = fmt_str(p, " +9="); p = fmt_u64(p, v->d);
-        p = fmt_str(p, (v->e & 1) ? " => predicted PROCEED" : " => predicted SKIP");
-        if (v->e & 2) p = fmt_str(p, " [more messages in this batch: not examined]");
+        p = fmt_str(p, "ENTRY recovery-receiver messages="); p = pd_val(p, v->a);
         break;
     case K_EXIT:
         p = fmt_str(p, "ENTRY exit-behaviour grp="); p = pd_val(p, v->a);
-        p = fmt_str(p, " +0x1b="); p = fmt_u64(p, v->b); p = fmt_str(p, " handle=");
-        p = v->c == NOTREAD ? fmt_str(p, "(none)") : fmt_hex(p, v->c);
+        if (v->ret == RET_FROM_ENTER) p = fmt_str(p, " (= enter-Physics started for this group)");
+        else if (v->ret == RET_FROM_RECOVER) p = fmt_str(p, " (= recovery receiver is ending Physics for this group)");
         break;
     case K_PURGE:
-        p = fmt_str(p, "SANITY purge ids="); p = fmt_u64(p, v->a);
-        if (v->a) { p = fmt_str(p, " first="); p = fmt_u64(p, v->b); }
+        p = fmt_str(p, "SANITY purge ids="); p = pd_val(p, v->a);
+        if (v->a && v->a != NOTREAD) { p = fmt_str(p, " first="); p = fmt_u64(p, v->b); }
         break;
     default:
         p = fmt_str(p, "?");

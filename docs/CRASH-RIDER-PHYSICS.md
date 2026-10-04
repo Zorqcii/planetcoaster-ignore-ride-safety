@@ -140,12 +140,51 @@ taken (no status line, no logging). Nothing here changes the "Unresolved" table.
 **Still open from the proposal:** the displayed status, group-wide behaviour (members checked), recovery duration, and any stranded guests.
 These would need a repeat under the original conditions: disposable copy, all options off, empty test run.
 
+### diag.2 revision 3 (2026-10-04): review outcome — **blocked on live-patch synchronisation; not installed**
+**Cross-core synchronisation: UNRESOLVED.** CPU: AMD Ryzen 9 5900X (Linux 6.18, Proton). The supported protocol for modifying code that
+other cores may execute (AMD APM vol. 2 "cross-modifying code"; Intel SDM vol. 3 §8.1.3) is: write the new bytes, then make every core
+that may execute them run a serialising instruction after the write and before executing the new bytes. diag.2 serialises only the
+patching thread (`cpuid`). On Linux, the mechanism that provides the protocol for other threads is
+`membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE)`. A Windows program under Proton has no documented API with that guarantee.
+`FlushInstructionCache` and `FlushProcessWriteBuffers` are not documented to serialise other cores, and Wine's implementation of them
+was not verified within scope. Thread suspension with `SuspendThread`/`ResumeThread` would rely on Wine's suspend/resume path being
+serialising, which is also not verified. **So the claim is limited to:** a single, atomic, aligned, same-length instruction swap where
+both the old and the new instruction are valid. That a core never executes a torn mix without serialisation is an **assumption**
+(common hot-patching practice, and the method used by every earlier build of this mod), **not a guarantee**.
+
+**Read validity (revision 3 change):** reads justified only by "the game reads it before its next call or lock" were removed, because
+that is evidence, not a lifetime or synchronisation guarantee. Native reads now are:
+* registers;
+* the current thread's stack (run-time bounds check against the thread's own stack base and limit), which is owned by the thread;
+* for the two patched purge calls, the id buffer of the caller's **stack-local vector**. Both callers zero the vector on their own
+  stack, fill it with their own push routine, pass it to purge, and free the buffer right after the call (`0x14046c069`–`0x14046c0a3`,
+  `0x140856a61`–`0x140856a90`). That is ownership established by the caller's code.
+Removed (no longer observable):
+* impact, request and recovery message contents (guest, group, reason, source), so the receivers log only their entry and, if the list
+  header is on the caller's stack, the message count;
+* all entry-check values (`+8`, `+9`, behaviour, `+0xd8`, source/`+0x9a50`, pending);
+* the guest→group map and pending-map lookups;
+* group-record fields at exit-behaviour (`+0x1b`, `+0x50`);
+* the physics-start key and guest id unless their pointer is on the calling thread's stack.
+Still observable natively: the group index at the post step, at enter-Physics (via exit-behaviour with return address `0x14069c8d1`)
+and at the recovery receiver's exit-behaviour call (return address `0x1406a8f4d`), all from the callers' stacks; the SOS guest id
+(caller's stack); purge id counts (script and station). Confirmed STATE still comes from the scripts.
+**Checks re-run on the revision-3 package** (DLL `790ddbed…`, ZIP sha256 `741893bb…`):
+* a fresh build is byte-identical; no excluded exports or strings;
+* the site table is unchanged (9/9) and the wrappers are 9/9 OK;
+* the scripts are identical and the version reads 0.2.0-diag.2;
+* every remaining body read is either the wrapper's register block, the mod's own data, or a pointer dereference after a run-time
+  stack-bounds check, except the purge buffer described above (verified in the compiled code).
+* The game-side checks (patch bytes, single instruction, interiors, register use) are unaffected by this change.
+**Decision needed:** the build is not installed. It stays blocked until the cross-core synchronisation question is either accepted by
+the owner as a stated assumption or resolved.
+
 ### diag.2 revision 2 (built and statically verified 2026-10-04; NOT installed, awaiting approval)
 Superseding the plan below after the owner's review: (1) unproven-concurrency reads removed, (2) only single-instruction patch points.
 
 **Patch points (9):** each replaces ONE instruction with ONE instruction of the same length at the same address, in one atomic
-aligned 8- or 16-byte compare-exchange (`lock cmpxchg` / `lock cmpxchg16b`). No thread can be part-way through a patched span; it
-either executes the old or the new complete instruction, or has passed it.
+aligned 8- or 16-byte compare-exchange (`lock cmpxchg` / `lock cmpxchg16b`). This resolves only the *inside-a-span* case: no thread
+can be part-way through a patched span. It does **not** resolve cross-core instruction-stream synchronisation (see revision 3).
 
 | # | Point | Kind | Unit |
 |---|---|---|---|
