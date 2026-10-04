@@ -16,8 +16,8 @@ When ticked:
 Tick "Ignore ride safety concerns" too, or timid guests refuse because of the assumed Fear 8.
 Unticking restores normal behaviour. All options reset to off when a park is loaded.
 
-Known: after a crash, riders reappear at the ride exit. The option's tooltip still says the ride
-"may still close after a crash"; that text is out of date.
+Known: when a train is destroyed in a crash, its passengers reappear at the ride exit (not at the crash site).
+The helper's log header reports 0.2.0-exp.5 (the native helper is unchanged since that build).
 
 REQUIREMENTS: Planet Coaster build 1.13.3.88540, ACSE-PlanetCoaster 0.2.
 Tested on Linux with Proton Experimental only; Windows is untested.

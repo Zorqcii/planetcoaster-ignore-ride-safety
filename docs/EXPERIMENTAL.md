@@ -10,7 +10,7 @@ Let guests board and ride incomplete or untested roller coasters, without changi
 1. The native helper gets reliable information about which rides are untested. **Done (0.2.0-exp.1), see results below.**
 2. Find out whether guests can board an untested or incomplete ride, and whether it dispatches with them. **Done (0.2.0-exp.3).**
 3. Operation after a crash: the ride stays open and trains respawn for the next riders. **Done (0.2.0-exp.5).**
-4. Riders stay at the crash site and walk back, as in RollerCoaster Tycoon. **Investigation started (0.2.0-exp.6, observe-only).**
+4. Riders stay at the crash site and walk back, as in RollerCoaster Tycoon. **Optional extension; separate branch `experimental/crash-rider-physics`.**
 
 ## Earlier findings (from the pre-release experiment), re-checked
 | Finding | Status |
@@ -118,3 +118,18 @@ Findings (static):
 0.2.0-exp.6 (Lua only; native helper unchanged and byte-identical to 0.2.0-exp.5): while the experimental option is on, counts those crash messages,
 records the fields of the first of each kind, and shows them plus the trapped-guest count in the diagnostics list. No behaviour change.
 Question: in this crash type, do riders go through the physics-incident / SOS path, or are they moved straight to the exit?
+
+## Milestone checkpoint: unfinished rides (0.2.0-exp.6, 2026-10-03)
+The unfinished-ride objective is met: guests board an incomplete coaster and it dispatches repeatedly. When a train is destroyed,
+passengers return to the ride exit (not the crash site).
+
+Evidence (owner's game, Planet Coaster 1.13.3.88540 / Steam build 14428432, Proton Experimental `experimental-11.0-20261001`):
+* In-game diagnostics with 0.2.0-exp.6: the unfinished coaster (station 221) was UNTESTED with 2 open track ends, **open**, with **21 riders**
+  on board, **165 departures** and no "not until tested" thoughts. "Guest code reached one of them: YES".
+* Helper log (0.2.0-exp.5): "skipped the crash close of a listed ride" 18 times across repeated crashes; no other close requests.
+* Owner checks: the ride's own Close button closes it; unticking the option mid-loop restores normal behaviour; with the option off the
+  safety and nausea options behave as in 0.1.0-beta.
+* Crash observer (0.2.0-exp.6): GuestPhysicsIncidentEnded 0, GuestHidden 0, trapped guests 0 across several crashes with riders aboard;
+  "EnteredSoSFromCrash" and "GroupPhysicsRecovery" are not exposed to Lua in this game. Owner: riders appear at the exit.
+
+Note: 0.2.0-exp.6 changed only Lua; its `IgnoreRideSafety.dll` is byte-identical to 0.2.0-exp.5 and its log header says "0.2.0-exp.5".
