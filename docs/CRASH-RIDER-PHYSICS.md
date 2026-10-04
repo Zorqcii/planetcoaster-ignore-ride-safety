@@ -153,7 +153,7 @@ No mechanism has been observed or identified that **safely transfers a detached 
    a passenger at the crash site.
 Per the round's rules this diagnostic round stops here. Next step only by owner decision.
 
-## Prototype 0.2.0-proto.1: one-rider physics launch (owner-approved, built, not yet tested)
+## Prototype 0.2.0-proto.1: one-rider physics launch (owner-approved, tested 2026-10-03: game crash)
 Package `IgnoreRideSafety-PROTOTYPE-0.2.0-proto.1.zip` (not published). It contains everything of 0.2.0-diag.1 plus a separate option,
 off by default and reset on park load: "PROTOTYPE (research): launch one crashed rider into guest physics". It works only while the
 experimental option is on; turning the experimental option off also removes the prototype hook. Crash-site positioning is out of scope.
@@ -193,6 +193,42 @@ Known limits (stated before the test):
   to show it.
 * Possible failures: game crash; guest stuck, frozen, invisible or permanently trapped; physics body never removed.
   Recovery: untick the prototype option; on any problem quit without saving and switch back to 0.2.0-exp.6.
+
+## Prototype result (0.2.0-proto.1, manual test 2026-10-03)
+Owner: "one stayed and then the game crashed". Log, times since the helper loaded:
+* 34.1 s: crash close (6 events); 36.4 s: crash purge (destroyed-vehicle listener). Rider list before the crash: 24.
+* 37.1 s: guest 443 eligible (exists, in its group, off the ride, group behaviour "Lost") → armed → **launched** in the update context
+  (thread 448). The start routine returned 1, the incident counter went 0 → 1, the timer was set to 5.0, and the guest was in the
+  physics guest map. The diagnostic hook logged the call as this mod's.
+* Scripts: the group's behaviour alternated Lost/Idle. It **never became "Physics"**.
+* 42.8 s (5.7 s after launch): `GuestPhysicsIncidentEnded`, 1 guest involved.
+* Up to the last log line (48.4 s) the guest had **not** left the physics guest map and its group was still present.
+* Then the game crashed (Frontier crash dump 21:47:39, kept locally and not in Git). It was an **access violation reading
+  `0x11c816d8dd2` at `0x1406a8f24`, with `rax = 0x7a490010`, the prototype's invented group key**.
+
+Crash analysis (static):
+* `0x1406a8ed0` is a message receiver (reached through the dispatcher at `0x1406f2594`). For each message it takes a dword key at
+  message `+0x18`, indexes an array of 0x250-byte records (`[system+0x3b8] + key*0x250`) and acts only if the record's byte `+0x1a` is
+  `0x0b`, then calls `0x14069cec0`.
+* `rides`/`guests:GetGuestGroupID` (`0x1403f90a0`) reads a guest's group index from the same kind of object: a per-guest array at
+  `+0x3b0`, 0x30 bytes each, field `+0x28`. The record array at `+0x3b8` is therefore very likely the **guest-group** array, and the
+  physics "group key" is the **guest's group index**, not a free value. This also fits the earlier findings: an incident group holds at most
+  6 guests (the guest-group size limit), and the message names `GroupPhysicsRecovery` / `GuestEnteredSoSFromCrash`.
+* The handler acts only on groups whose record byte `+0x1a` is `0x0b`, very likely the group's "Physics" behaviour. The start routine
+  does not set it, and the scripts never saw "Physics". In the game's own path, the (protected) caller presumably puts the group into
+  that state; how it does so is unknown.
+
+Conclusions:
+* **The crash was caused by the prototype** (invented group key used as an array index by the game). Seen once; not a game bug.
+* The physics start routine can be entered from the update context without an immediate failure. The incident timer runs and the
+  incident-ended message is sent. But **recovery did not complete**: the guest "stayed" and did not leave the physics map in ≥ 6 s after
+  the incident ended, and the group never entered the Physics behaviour.
+* A safe transfer needs (a) the guest's real group index as the key and (b) the group put into the game's Physics behaviour state
+  the way the game does it. (b) lives in the protected caller and is not identified. Using the real key alone would most likely avoid
+  this crash, but the handler would then skip the group (state not 0x0b), leaving the guest stuck. That outcome is predicted, not tested.
+
+**Decision: stop.** No further prototype without a way to establish (b). The installed build was switched back to 0.2.0-exp.6
+(hashes verified); the prototype and diagnostic packages and the test logs are kept locally.
 
 ## Earlier proposal (superseded by the plan above)
 An **observe-only** helper build: log-only entry hooks on the purge routine `0x14081a0a0`, the train-removed handler `0x1405d3fb0` and the start
