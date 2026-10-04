@@ -2,23 +2,31 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  * Copyright (C) 2026 Zorqcii
  *
- * DIAGNOSTIC 0.2.0-diag.2: logging-only observation of the game's own guest-physics chain
- * (natural impact -> group request -> enter Physics -> per-guest launch -> recovery).
- * Built instead of irs_experimental.c (build variant IRS_PHYSDIAG): this build contains NO gameplay
- * patch (no open gate, no rating changes, no close skips), NO prototype/launch code, and the
- * safety and nausea options refuse to turn on.
+ * DIAGNOSTIC 0.2.0-diag.2: logging-only observation of the game's own guest-physics chain.
+ * Built instead of irs_experimental.c (build variant IRS_PHYSDIAG): NO gameplay patch, NO
+ * experimental/diag.1/prototype code; the safety and nausea options refuse to turn on.
  *
- * Ten entry hooks, each a 5-7 byte `jmp` over whole instructions at a function start. The wrapper
- * saves the argument registers, calls a C body that only READS memory the hooked routine itself
- * reads at that point, writes an event to a ring buffer, restores the registers and continues in
- * the original code through a trampoline. Nothing in the game is written. The log file is written
- * only from the script thread (irs_pd_report).
+ * Patch points: every patch replaces exactly ONE instruction by ONE instruction of the same length
+ * at the same address, written with a single atomic aligned 8- or 16-byte compare-exchange. A thread
+ * can therefore never be "inside" a patched span: it is either before the instruction (and executes
+ * the old or the new one, both complete and valid) or after it.
+ *   ENTRY  sites: a 5-byte first instruction (mov [rsp+x],reg) is replaced by `jmp stub`; the
+ *                 trampoline executes the original instruction and jumps to the next one.
+ *   REDIRECT sites: a `jmp rel32` / `call rel32` to the observed routine is re-targeted to the stub;
+ *                 the wrapper then jumps to the original target.
  *
- * Event labels in the log:
- *   ENTRY  - a hooked function was entered; values are as read at entry; outcomes are "predicted"
- *   STATE  - a confirmed state change observed later (guest entered/left the physics guest map,
- *            group key appeared/disappeared; script-side behaviour changes and messages)
- *   SANITY - the unloading routine (purge); a sanity check only, not proof that every crash was seen
+ * Read policy (hook bodies): a hook body reads only
+ *   (a) values in argument registers;
+ *   (b) memory on the CURRENT thread's stack (checked at run time against the thread's stack bounds);
+ *   (c) game memory that the observed routine itself reads on this call before any call, lock or
+ *       other synchronisation (verified offline per read), so the read happens under the same
+ *       conditions as the game's own unsynchronised read.
+ * Nothing else is read natively. Confirmed state (displayed behaviour, group members, messages) is
+ * taken by the scripts through the game's public script functions on the script thread.
+ *
+ * Log labels: ENTRY = a routine was entered (values as read at entry, outcomes are predictions);
+ * STATE = a confirmed change, from the scripts; SANITY = purge (unloading) calls from the script
+ * binding and the station purge only - the crash-time purge call is not observable here.
  */
 
 __declspec(dllimport) void *__stdcall VirtualAlloc(void *, uintptr_t, DWORD, DWORD);
@@ -29,7 +37,6 @@ int _fltused = 0;
 
 #define PD_BUILD 3                  /* irs_pd_build: 3 = 0.2.0-diag.2 */
 
-/* ---- formatting (no C runtime) ---------------------------------------------------------- */
 static char *fmt_u64(char *p, uint64_t v)
 {
     char t[24]; int n = 0;
@@ -47,145 +54,114 @@ static char *fmt_hex(char *p, uint64_t v)
     return p;
 }
 
-/* ---- hook sites ----------------------------------------------------------------------------
- * n = length of the overwritten span = whole instructions (verified offline); patch = e9 rel32 to
- * the stub, then 1-byte (90) or 2-byte (66 90) nop fill. Every span lies in one aligned 8-byte word. */
-struct pdsite { uint64_t va; int n; uint8_t orig[8]; uint8_t patch[8]; const char *name; };
-enum { S_IMPACT, S_POST, S_REQUEST, S_ENTER, S_LAUNCH, S_UPDATE, S_SOS, S_RECOVER, S_EXIT, S_PURGE, PD_NSITES };
+/* ---- patch points ----------------------------------------------------------------------- */
+enum { PK_ENTRY = 1, PK_REDIRECT = 2 };
+struct pdsite {
+    uint64_t va; int n; uint8_t orig[8]; uint8_t patch[8];
+    int kind; int width;            /* atomic write unit: 8 or 16 bytes, aligned, containing the instruction */
+    uint64_t target;                /* REDIRECT: original destination of the jmp/call */
+    const char *name;
+};
+enum { S_IMPACT, S_POST, S_REQUEST, S_LAUNCH, S_SOS, S_RECOVER, S_EXIT, S_PURGE_SCRIPT, S_PURGE_STATION, PD_NSITES };
 static struct pdsite g_pd_sites[PD_NSITES] = {
-    {0x1406b58b0ULL, 6, {0x4c, 0x8b, 0xdc, 0x53, 0x41, 0x54}, {0}, "impact receiver"},          /* mov r11,rsp ; push rbx ; push r12 */
-    {0x1406f0a00ULL, 5, {0x48, 0x89, 0x5c, 0x24, 0x10}, {0}, "post group request"},              /* mov [rsp+0x10],rbx */
-    {0x1406a8bc0ULL, 6, {0x40, 0x53, 0x56, 0x57, 0x41, 0x56}, {0}, "request receiver"},          /* push rbx (40 53) ; push rsi ; push rdi ; push r14 */
-    {0x14069c8a0ULL, 7, {0x4c, 0x8b, 0xdc, 0x4d, 0x89, 0x4b, 0x20}, {0}, "enter Physics"},       /* mov r11,rsp ; mov [r11+0x20],r9 */
-    {0x14067d450ULL, 5, {0x4c, 0x89, 0x4c, 0x24, 0x20}, {0}, "physics start"},                   /* mov [rsp+0x20],r9 */
-    {0x14067de10ULL, 5, {0x48, 0x8b, 0xc4, 0x55, 0x53}, {0}, "guest-physics update"},            /* mov rax,rsp ; push rbp ; push rbx */
-    {0x140680af0ULL, 5, {0x48, 0x89, 0x5c, 0x24, 0x20}, {0}, "SOS step"},                        /* mov [rsp+0x20],rbx */
-    {0x1406a8ed0ULL, 5, {0x48, 0x89, 0x5c, 0x24, 0x08}, {0}, "recovery receiver"},               /* mov [rsp+8],rbx */
-    {0x14069cec0ULL, 5, {0x48, 0x89, 0x5c, 0x24, 0x20}, {0}, "exit behaviour"},                  /* mov [rsp+0x20],rbx */
-    {0x14081a0a0ULL, 5, {0x48, 0x8b, 0xc4, 0x55, 0x53}, {0}, "purge (unloading)"},               /* mov rax,rsp ; push rbp ; push rbx */
+    {0x1406f1fa4ULL, 5, {0xe9, 0x07, 0x39, 0xfc, 0xff}, {0}, PK_REDIRECT, 16, 0x1406b58b0ULL, "impact receiver (dispatcher jmp)"},
+    {0x1406f0a00ULL, 5, {0x48, 0x89, 0x5c, 0x24, 0x10}, {0}, PK_ENTRY, 8, 0, "post group request (entry)"},
+    {0x1406f2634ULL, 5, {0xe9, 0x87, 0x65, 0xfb, 0xff}, {0}, PK_REDIRECT, 16, 0x1406a8bc0ULL, "request receiver (dispatcher jmp)"},
+    {0x14067d450ULL, 5, {0x4c, 0x89, 0x4c, 0x24, 0x20}, {0}, PK_ENTRY, 8, 0, "physics start (entry)"},
+    {0x140680af0ULL, 5, {0x48, 0x89, 0x5c, 0x24, 0x20}, {0}, PK_ENTRY, 8, 0, "SOS step (entry)"},
+    {0x1406f2594ULL, 5, {0xe9, 0x37, 0x69, 0xfb, 0xff}, {0}, PK_REDIRECT, 16, 0x1406a8ed0ULL, "recovery receiver (dispatcher jmp)"},
+    {0x14069cec0ULL, 5, {0x48, 0x89, 0x5c, 0x24, 0x20}, {0}, PK_ENTRY, 8, 0, "exit behaviour (entry)"},
+    {0x14046c099ULL, 5, {0xe8, 0x02, 0xe0, 0x3a, 0x00}, {0}, PK_REDIRECT, 8, 0x14081a0a0ULL, "purge from script binding (call)"},
+    {0x140856a86ULL, 5, {0xe8, 0x15, 0x36, 0xfc, 0xff}, {0}, PK_REDIRECT, 16, 0x14081a0a0ULL, "purge from station purge (call)"},
 };
 
 static const struct fp g_pd_fps[] = {
-    /* D1 impact receiver after entry .. message loop: guest +0x18, map +0x218/+0x220 (64-bit hash) */
-    {0x1406b58b6ULL, 24, {0x41, 0x57, 0x48, 0x83, 0xec, 0x60, 0x48, 0x8b, 0x5a, 0x10, 0x4c, 0x8b, 0xf9, 0x48, 0x8b, 0x42, 0x08, 0x45, 0x33, 0xe4, 0x48, 0x8d, 0x04, 0xc3}},
-    {0x1406b58ceULL, 24, {0x48, 0x8b, 0xc8, 0x48, 0x2b, 0xcb, 0x48, 0x83, 0xc1, 0x07, 0x48, 0xc1, 0xe9, 0x03, 0x48, 0x3b, 0xd8, 0x49, 0x0f, 0x47, 0xcc, 0x48, 0x89, 0x4c}},
-    {0x1406b58e6ULL, 24, {0x24, 0x30, 0x48, 0x85, 0xc9, 0x0f, 0x84, 0x3e, 0x02, 0x00, 0x00, 0x49, 0x89, 0x73, 0xe0, 0x41, 0xb9, 0x42, 0x11, 0x00, 0x00, 0x49, 0x89, 0x6b}},
-    {0x1406b58feULL, 18, {0x08, 0x49, 0x89, 0x7b, 0xd8, 0x4d, 0x89, 0x6b, 0xd0, 0x4d, 0x89, 0x73, 0xc8, 0x0f, 0x1f, 0x44, 0x00, 0x00}},
-    /* D1: guest = [msg+0x18] ; hash ; div [r15+0x220] ; buckets [r15+0x218] ; node key +8, value +0x10 */
+    /* P1 dispatcher stub: mov rcx,[rcx+8] (then jmp impact receiver = site) */
+    {0x1406f1fa0ULL, 4, {0x48, 0x8b, 0x49, 0x08}},
+    /* impact receiver: entry .. message 0 checks and pending-map lookup (reads mirrored by P1, all before its first call) */
+    {0x1406b58b0ULL, 24, {0x4c, 0x8b, 0xdc, 0x53, 0x41, 0x54, 0x41, 0x57, 0x48, 0x83, 0xec, 0x60, 0x48, 0x8b, 0x5a, 0x10, 0x4c, 0x8b, 0xf9, 0x48, 0x8b, 0x42, 0x08, 0x45}},
+    {0x1406b58c8ULL, 24, {0x33, 0xe4, 0x48, 0x8d, 0x04, 0xc3, 0x48, 0x8b, 0xc8, 0x48, 0x2b, 0xcb, 0x48, 0x83, 0xc1, 0x07, 0x48, 0xc1, 0xe9, 0x03, 0x48, 0x3b, 0xd8, 0x49}},
+    {0x1406b58e0ULL, 24, {0x0f, 0x47, 0xcc, 0x48, 0x89, 0x4c, 0x24, 0x30, 0x48, 0x85, 0xc9, 0x0f, 0x84, 0x3e, 0x02, 0x00, 0x00, 0x49, 0x89, 0x73, 0xe0, 0x41, 0xb9, 0x42}},
+    {0x1406b58f8ULL, 24, {0x11, 0x00, 0x00, 0x49, 0x89, 0x6b, 0x08, 0x49, 0x89, 0x7b, 0xd8, 0x4d, 0x89, 0x6b, 0xd0, 0x4d, 0x89, 0x73, 0xc8, 0x0f, 0x1f, 0x44, 0x00, 0x00}},
     {0x1406b5910ULL, 24, {0x48, 0x8b, 0x33, 0x48, 0x8b, 0x4e, 0x18, 0x48, 0x8b, 0xd1, 0x48, 0x8b, 0xc1, 0x48, 0xf7, 0xd0, 0x48, 0xc1, 0xe2, 0x12, 0x48, 0x03, 0xd0, 0x48}},
     {0x1406b5928ULL, 24, {0x8b, 0xc2, 0x48, 0xc1, 0xe8, 0x1f, 0x48, 0x33, 0xc2, 0x48, 0x6b, 0xd0, 0x15, 0x48, 0x8b, 0xc2, 0x48, 0xc1, 0xe8, 0x0b, 0x48, 0x33, 0xc2, 0x48}},
     {0x1406b5940ULL, 24, {0x6b, 0xd0, 0x41, 0x48, 0x8b, 0xc2, 0x8b, 0xd2, 0x48, 0xc1, 0xe8, 0x16, 0x8b, 0xc0, 0x48, 0x33, 0xc2, 0x33, 0xd2, 0x49, 0xf7, 0xb7, 0x20, 0x02}},
-    {0x1406b5958ULL, 20, {0x00, 0x00, 0x49, 0x8b, 0x87, 0x18, 0x02, 0x00, 0x00, 0x4c, 0x8d, 0x04, 0xd0, 0x48, 0x8b, 0x04, 0xd0, 0x49, 0x3b, 0xc0}},
-    /* D1: [r15+0x288][idx] == guest ; rec = [[r15+0x1d0]+0x3b8]+idx*0x250 ; +8 ; +0x1a mask ; +9 ; reason(+0x38)==2 && +0xd8 ; src(+0x40) vs +0x9a50 */
-    {0x1406b5985ULL, 24, {0x48, 0x85, 0xc0, 0x0f, 0x84, 0x6d, 0x01, 0x00, 0x00, 0x44, 0x8b, 0x50, 0x10, 0x49, 0x8b, 0x87, 0x88, 0x02, 0x00, 0x00, 0x41, 0x8b, 0xd2, 0x44}},
-    {0x1406b599dULL, 24, {0x89, 0x94, 0x24, 0x88, 0x00, 0x00, 0x00, 0x4a, 0x39, 0x0c, 0xd0, 0x0f, 0x85, 0x4d, 0x01, 0x00, 0x00, 0x49, 0x8b, 0xbf, 0xd0, 0x01, 0x00, 0x00}},
-    {0x1406b59b5ULL, 24, {0x4c, 0x8d, 0x6e, 0x38, 0x4c, 0x8b, 0x5e, 0x40, 0x48, 0x69, 0xca, 0x50, 0x02, 0x00, 0x00, 0x48, 0x03, 0x8f, 0xb8, 0x03, 0x00, 0x00, 0x80, 0x79}},
-    {0x1406b59cdULL, 24, {0x08, 0x00, 0x0f, 0x84, 0x26, 0x01, 0x00, 0x00, 0x0f, 0xb6, 0x41, 0x1a, 0x3c, 0x0c, 0x0f, 0x87, 0x1a, 0x01, 0x00, 0x00, 0x0f, 0xb6, 0xc0, 0x41}},
-    {0x1406b59e5ULL, 24, {0x0f, 0xa3, 0xc1, 0x0f, 0x83, 0x0d, 0x01, 0x00, 0x00, 0x80, 0x79, 0x09, 0x00, 0x0f, 0x84, 0x03, 0x01, 0x00, 0x00, 0x41, 0x83, 0x7d, 0x00, 0x02}},
-    {0x1406b59fdULL, 6, {0x75, 0x2d, 0x80, 0xb9, 0xd8, 0x00}},
-    /* D1: pending map +0x250/+0x238/+0x240 (32-bit hash), node key dword +8 */
-    {0x1406b5a39ULL, 24, {0x49, 0x83, 0xbf, 0x50, 0x02, 0x00, 0x00, 0x00, 0x74, 0x63, 0x41, 0x69, 0xc2, 0x01, 0x10, 0x00, 0x00, 0x33, 0xd2, 0x8b, 0xc8, 0xc1, 0xe9, 0x16}},
-    {0x1406b5a51ULL, 24, {0x33, 0xc8, 0x6b, 0xc1, 0x11, 0x8b, 0xc8, 0xc1, 0xe9, 0x09, 0x33, 0xc8, 0x69, 0xc1, 0x01, 0x04, 0x00, 0x00, 0x8b, 0xc8, 0xc1, 0xe9, 0x02, 0x33}},
-    {0x1406b5a69ULL, 24, {0xc8, 0x69, 0xc1, 0x81, 0x00, 0x00, 0x00, 0x8b, 0xc8, 0x48, 0xc1, 0xe8, 0x0c, 0x48, 0x33, 0xc1, 0x49, 0xf7, 0xb7, 0x40, 0x02, 0x00, 0x00, 0x49}},
-    {0x1406b5a81ULL, 24, {0x8b, 0x87, 0x38, 0x02, 0x00, 0x00, 0x48, 0x8d, 0x0c, 0xd0, 0x48, 0x8b, 0x04, 0xd0, 0x48, 0x3b, 0xc1, 0x74, 0x12, 0x44, 0x3b, 0x50, 0x08, 0x0f}},
-    {0x1406b5a99ULL, 13, {0x84, 0x9b, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x00, 0x48, 0x3b, 0xc1, 0x75, 0xee}},
-    /* D2 post request after entry: rdx=&group, r8, r9, stack args */
+    {0x1406b5958ULL, 24, {0x00, 0x00, 0x49, 0x8b, 0x87, 0x18, 0x02, 0x00, 0x00, 0x4c, 0x8d, 0x04, 0xd0, 0x48, 0x8b, 0x04, 0xd0, 0x49, 0x3b, 0xc0, 0x0f, 0x84, 0x89, 0x01}},
+    {0x1406b5970ULL, 24, {0x00, 0x00, 0x48, 0x3b, 0x48, 0x08, 0x74, 0x0d, 0x48, 0x8b, 0x00, 0x49, 0x3b, 0xc0, 0x75, 0xf2, 0xe9, 0x76, 0x01, 0x00, 0x00, 0x48, 0x85, 0xc0}},
+    {0x1406b5988ULL, 24, {0x0f, 0x84, 0x6d, 0x01, 0x00, 0x00, 0x44, 0x8b, 0x50, 0x10, 0x49, 0x8b, 0x87, 0x88, 0x02, 0x00, 0x00, 0x41, 0x8b, 0xd2, 0x44, 0x89, 0x94, 0x24}},
+    {0x1406b59a0ULL, 24, {0x88, 0x00, 0x00, 0x00, 0x4a, 0x39, 0x0c, 0xd0, 0x0f, 0x85, 0x4d, 0x01, 0x00, 0x00, 0x49, 0x8b, 0xbf, 0xd0, 0x01, 0x00, 0x00, 0x4c, 0x8d, 0x6e}},
+    {0x1406b59b8ULL, 24, {0x38, 0x4c, 0x8b, 0x5e, 0x40, 0x48, 0x69, 0xca, 0x50, 0x02, 0x00, 0x00, 0x48, 0x03, 0x8f, 0xb8, 0x03, 0x00, 0x00, 0x80, 0x79, 0x08, 0x00, 0x0f}},
+    {0x1406b59d0ULL, 24, {0x84, 0x26, 0x01, 0x00, 0x00, 0x0f, 0xb6, 0x41, 0x1a, 0x3c, 0x0c, 0x0f, 0x87, 0x1a, 0x01, 0x00, 0x00, 0x0f, 0xb6, 0xc0, 0x41, 0x0f, 0xa3, 0xc1}},
+    {0x1406b59e8ULL, 24, {0x0f, 0x83, 0x0d, 0x01, 0x00, 0x00, 0x80, 0x79, 0x09, 0x00, 0x0f, 0x84, 0x03, 0x01, 0x00, 0x00, 0x41, 0x83, 0x7d, 0x00, 0x02, 0x75, 0x2d, 0x80}},
+    {0x1406b5a00ULL, 24, {0xb9, 0xd8, 0x00, 0x00, 0x00, 0x01, 0x75, 0x24, 0x48, 0x8b, 0x8f, 0x58, 0x02, 0x00, 0x00, 0x48, 0x8d, 0x94, 0x24, 0x90, 0x00, 0x00, 0x00, 0x44}},
+    {0x1406b5a18ULL, 24, {0x89, 0x94, 0x24, 0x90, 0x00, 0x00, 0x00, 0xe8, 0x6c, 0x85, 0x01, 0x00, 0x84, 0xc0, 0x0f, 0x85, 0xcf, 0x00, 0x00, 0x00, 0x4c, 0x3b, 0x9f, 0x50}},
+    {0x1406b5a30ULL, 24, {0x9a, 0x00, 0x00, 0x0f, 0x84, 0xc2, 0x00, 0x00, 0x00, 0x49, 0x83, 0xbf, 0x50, 0x02, 0x00, 0x00, 0x00, 0x74, 0x63, 0x41, 0x69, 0xc2, 0x01, 0x10}},
+    {0x1406b5a48ULL, 24, {0x00, 0x00, 0x33, 0xd2, 0x8b, 0xc8, 0xc1, 0xe9, 0x16, 0x33, 0xc8, 0x6b, 0xc1, 0x11, 0x8b, 0xc8, 0xc1, 0xe9, 0x09, 0x33, 0xc8, 0x69, 0xc1, 0x01}},
+    {0x1406b5a60ULL, 24, {0x04, 0x00, 0x00, 0x8b, 0xc8, 0xc1, 0xe9, 0x02, 0x33, 0xc8, 0x69, 0xc1, 0x81, 0x00, 0x00, 0x00, 0x8b, 0xc8, 0x48, 0xc1, 0xe8, 0x0c, 0x48, 0x33}},
+    {0x1406b5a78ULL, 24, {0xc1, 0x49, 0xf7, 0xb7, 0x40, 0x02, 0x00, 0x00, 0x49, 0x8b, 0x87, 0x38, 0x02, 0x00, 0x00, 0x48, 0x8d, 0x0c, 0xd0, 0x48, 0x8b, 0x04, 0xd0, 0x48}},
+    {0x1406b5a90ULL, 22, {0x3b, 0xc1, 0x74, 0x12, 0x44, 0x3b, 0x50, 0x08, 0x0f, 0x84, 0x9b, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x00, 0x48, 0x3b, 0xc1, 0x75, 0xee}},
+    /* P2 post group request after entry */
     {0x1406f0a05ULL, 24, {0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xec, 0x20, 0x8b, 0x05, 0x2f, 0x4e, 0x4e, 0x01, 0x48, 0x8b, 0xf2, 0x48, 0x8d, 0x54, 0x24, 0x30}},
-    {0x1406f0a1dULL, 12, {0x89, 0x44, 0x24, 0x30, 0x49, 0x8b, 0xd9, 0x49, 0x8b, 0xf8, 0xe8, 0x04}},
-    /* D2: reads [rdx] group, [stack+0x50] reason, [stack+0x58] source */
-    {0x1406f0a40ULL, 24, {0xf3, 0x0f, 0x10, 0x43, 0x08, 0x0f, 0x12, 0x23, 0x0f, 0x28, 0xd0, 0x0f, 0x12, 0x1f, 0xf3, 0x0f, 0x10, 0x47, 0x08, 0x8b, 0x06, 0x48, 0x8b, 0x54}},
-    {0x1406f0a58ULL, 24, {0x24, 0x50, 0x48, 0x8b, 0x4c, 0x24, 0x58, 0x0f, 0x16, 0xd8, 0x0f, 0x16, 0xe2, 0x44, 0x8b, 0x02, 0x48, 0x8d, 0x15, 0x71, 0xce, 0x2f, 0x01, 0x48}},
-    {0x1406f0a70ULL, 24, {0x8b, 0x09, 0x49, 0x89, 0x12, 0x8b, 0x15, 0xc5, 0x4d, 0x4e, 0x01, 0x41, 0x89, 0x52, 0x08, 0x8b, 0x15, 0xbf, 0x4d, 0x4e, 0x01, 0x41, 0x89, 0x52}},
-    {0x1406f0a88ULL, 24, {0x0c, 0x48, 0x8b, 0x15, 0xb8, 0x4d, 0x4e, 0x01, 0x49, 0x89, 0x52, 0x10, 0x48, 0x8d, 0x15, 0x35, 0xae, 0x2e, 0x01, 0x49, 0x89, 0x12, 0x41, 0x89}},
-    {0x1406f0aa0ULL, 24, {0x42, 0x18, 0x49, 0x8b, 0xc2, 0x45, 0x89, 0x42, 0x1c, 0x41, 0x0f, 0x13, 0x5a, 0x20, 0x0f, 0x12, 0xdb, 0xf3, 0x41, 0x0f, 0x11, 0x5a, 0x28, 0x41}},
-    {0x1406f0ab8ULL, 18, {0x0f, 0x13, 0x62, 0x2c, 0x0f, 0x12, 0xe4, 0xf3, 0x41, 0x0f, 0x11, 0x62, 0x34, 0x49, 0x89, 0x4a, 0x38, 0x48}},
-    /* D3 request receiver after entry */
-    {0x1406a8bc5ULL, 24, {0x56, 0x48, 0x83, 0xec, 0x38, 0x48, 0x8b, 0x5a, 0x10, 0x33, 0xff, 0x48, 0x8b, 0x42, 0x08, 0x48, 0x8b, 0xf1, 0x48, 0x8d, 0x04, 0xc3, 0x4c, 0x8b}},
-    {0x1406a8bddULL, 12, {0xf0, 0x4c, 0x2b, 0xf3, 0x49, 0x83, 0xc6, 0x07, 0x49, 0xc1, 0xee, 0x03}},
-    /* D3: msg +0x18 group, +0x1c reason, +0x38 source ; rec +8, +0x1a mask, +9, +0xd8 ; +0x9a50 */
-    {0x1406a8c10ULL, 24, {0x48, 0x8b, 0x2b, 0x48, 0x8b, 0x86, 0xb8, 0x03, 0x00, 0x00, 0x44, 0x8b, 0x55, 0x18, 0x4c, 0x8b, 0x5d, 0x38, 0x4d, 0x69, 0xfa, 0x50, 0x02, 0x00}},
-    {0x1406a8c28ULL, 24, {0x00, 0x41, 0x80, 0x7c, 0x07, 0x08, 0x00, 0x49, 0x8d, 0x0c, 0x07, 0x74, 0x6d, 0x0f, 0xb6, 0x41, 0x1a, 0x3c, 0x0c, 0x77, 0x65, 0x41, 0x0f, 0xa3}},
-    {0x1406a8c40ULL, 24, {0xc4, 0x73, 0x5f, 0x80, 0x79, 0x09, 0x00, 0x74, 0x59, 0x83, 0x7d, 0x1c, 0x02, 0x75, 0x23, 0x80, 0xb9, 0xd8, 0x00, 0x00, 0x00, 0x01, 0x75, 0x1a}},
-    {0x1406a8c58ULL, 24, {0x48, 0x8b, 0x8e, 0x58, 0x02, 0x00, 0x00, 0x48, 0x8d, 0x54, 0x24, 0x68, 0x44, 0x89, 0x54, 0x24, 0x68, 0xe8, 0x22, 0x53, 0x02, 0x00, 0x84, 0xc0}},
-    {0x1406a8c70ULL, 14, {0x75, 0x30, 0x4c, 0x3b, 0x9e, 0x50, 0x9a, 0x00, 0x00, 0x74, 0x27, 0x4c, 0x8b, 0x86}},
-    /* D3: call enter-Physics(rsi, &group, rec, msg+0x2c, reason) */
-    {0x1406a8c7bULL, 24, {0x4c, 0x8b, 0x86, 0xb8, 0x03, 0x00, 0x00, 0x4c, 0x8d, 0x4d, 0x2c, 0x8b, 0x45, 0x1c, 0x48, 0x8d, 0x54, 0x24, 0x68, 0x4d, 0x03, 0xc7, 0x44, 0x89}},
-    {0x1406a8c93ULL, 10, {0x54, 0x24, 0x68, 0x48, 0x8b, 0xce, 0x89, 0x44, 0x24, 0x20}},
-    /* D4 enter-Physics after entry: rdx=&group, r8=rec, r9=vec3, reason [rsp+0xa0] ; members [rec],[rec+4] ; guest [[r15+0x3b0]+i*0x30+8] */
-    {0x14069c8a7ULL, 24, {0x53, 0x55, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 0x50, 0x8b, 0x02, 0x49, 0x8b, 0xd9, 0x4c, 0x8b, 0xea, 0x41, 0x89, 0x43, 0x10}},
-    {0x14069c8bfULL, 24, {0x45, 0x33, 0xc9, 0x49, 0x8d, 0x53, 0x10, 0x4d, 0x8b, 0xf0, 0x4c, 0x8b, 0xf9, 0xe8, 0xef, 0x05, 0x00, 0x00, 0x49, 0x83, 0x7e, 0x50, 0xff, 0x75}},
-    {0x14069c8d7ULL, 24, {0x1c, 0x49, 0x8b, 0x87, 0x98, 0x01, 0x00, 0x00, 0xb9, 0x01, 0x00, 0x00, 0x00, 0xf0, 0x48, 0x0f, 0xc1, 0x88, 0xb0, 0x00, 0x00, 0x00, 0x48, 0xff}},
-    {0x14069c8efULL, 21, {0xc1, 0x49, 0x89, 0x4e, 0x50, 0x41, 0x8b, 0x2e, 0x41, 0x3b, 0x6e, 0x04, 0x0f, 0x84, 0x07, 0x01, 0x00, 0x00, 0x48, 0x89, 0xb4}},
-    /* D4: member guest entity from [rdi+8] */
-    {0x14069c983ULL, 16, {0x49, 0x8b, 0x5e, 0x50, 0x48, 0x8b, 0x7f, 0x08, 0x4d, 0x8b, 0xa7, 0xa0, 0x01, 0x00, 0x00, 0xe8}},
-    /* D4: mov word [r14+0x1a],0x10b */
-    {0x14069ca08ULL, 7, {0x66, 0x41, 0xc7, 0x46, 0x1a, 0x0b, 0x01}},
-    /* D5 physics start after entry */
-    {0x14067d455ULL, 22, {0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 0x48, 0x4c, 0x8b, 0xe2, 0x48, 0x8b, 0xe9}},
-    /* D5: mov rbx,r8 */
-    {0x14067d475ULL, 3, {0x49, 0x8b, 0xd8}},
-    /* D5: mov edx,[rbx] (group key) */
-    {0x14067d48fULL, 2, {0x8b, 0x13}},
-    /* D5: mov rcx,[r12] (guest id) */
-    {0x14067d4a0ULL, 4, {0x49, 0x8b, 0x0c, 0x24}},
-    /* D6 guest-physics update after entry .. mov r14,rcx */
-    {0x14067de15ULL, 24, {0x41, 0x56, 0x48, 0x8d, 0xa8, 0x68, 0xf6, 0xff, 0xff, 0x48, 0x81, 0xec, 0x80, 0x0a, 0x00, 0x00, 0x0f, 0x29, 0x78, 0x98, 0x4c, 0x8b, 0xf1, 0x48}},
-    /* start: add rcx,0x248 (group map) */
-    {0x14067d46bULL, 7, {0x48, 0x81, 0xc1, 0x48, 0x02, 0x00, 0x00}},
-    /* start: lea rcx,[rbp+0x228] (guest map) */
-    {0x14067d47dULL, 7, {0x48, 0x8d, 0x8d, 0x28, 0x02, 0x00, 0x00}},
-    /* start: inc [rbp+0x288] ; timer [rbp+0x290] */
-    {0x14067d6f0ULL, 19, {0x48, 0xff, 0x85, 0x88, 0x02, 0x00, 0x00, 0xb0, 0x01, 0xc7, 0x85, 0x90, 0x02, 0x00, 0x00, 0x00, 0x00, 0xa0, 0x40}},
-    /* guest map lookup (re-implemented read-only) */
-    {0x1400c6f70ULL, 24, {0x4c, 0x8b, 0x02, 0x48, 0x8b, 0xf1, 0x4d, 0x8b, 0xc8, 0x49, 0x8b, 0xc0, 0x48, 0xf7, 0xd0, 0x49, 0xc1, 0xe1, 0x12, 0x4c, 0x03, 0xc8, 0x4c, 0x8b}},
-    {0x1400c6f88ULL, 24, {0xf2, 0x49, 0x8b, 0xc1, 0x33, 0xd2, 0x48, 0xc1, 0xe8, 0x1f, 0x49, 0x33, 0xc1, 0x48, 0x6b, 0xc8, 0x15, 0x48, 0x8b, 0xc1, 0x48, 0xc1, 0xe8, 0x0b}},
-    {0x1400c6fa0ULL, 24, {0x48, 0x33, 0xc1, 0x48, 0x6b, 0xc8, 0x41, 0x48, 0x8b, 0xc1, 0x8b, 0xc9, 0x48, 0xc1, 0xe8, 0x16, 0x8b, 0xc0, 0x48, 0x33, 0xc1, 0x48, 0xf7, 0x76}},
-    {0x1400c6fb8ULL, 24, {0x08, 0x48, 0x8b, 0x06, 0x48, 0x8d, 0x0c, 0xd0, 0x48, 0x8b, 0x04, 0xd0, 0x48, 0x8b, 0xf9, 0x48, 0x3b, 0xc1, 0x74, 0x19, 0x0f, 0x1f, 0x40, 0x00}},
-    {0x1400c6fd0ULL, 21, {0x4c, 0x3b, 0x40, 0x08, 0x0f, 0x84, 0xe3, 0x00, 0x00, 0x00, 0x48, 0x8b, 0xf8, 0x48, 0x8b, 0x00, 0x48, 0x3b, 0xc1, 0x75, 0xeb}},
-    /* group map lookup (re-implemented read-only) */
-    {0x1406e9120ULL, 24, {0x44, 0x8b, 0x02, 0x48, 0x8b, 0xf1, 0x41, 0x69, 0xc0, 0x01, 0x10, 0x00, 0x00, 0x4c, 0x8b, 0xf2, 0x33, 0xd2, 0x44, 0x8b, 0xc8, 0x41, 0xc1, 0xe9}},
-    {0x1406e9138ULL, 24, {0x16, 0x44, 0x33, 0xc8, 0x41, 0x6b, 0xc1, 0x11, 0x44, 0x8b, 0xc8, 0x41, 0xc1, 0xe9, 0x09, 0x44, 0x33, 0xc8, 0x41, 0x69, 0xc1, 0x01, 0x04, 0x00}},
-    {0x1406e9150ULL, 24, {0x00, 0x8b, 0xc8, 0xc1, 0xe9, 0x02, 0x33, 0xc8, 0x69, 0xc1, 0x81, 0x00, 0x00, 0x00, 0x8b, 0xc8, 0x48, 0xc1, 0xe8, 0x0c, 0x48, 0x33, 0xc1, 0x48}},
-    {0x1406e9168ULL, 24, {0xf7, 0x76, 0x08, 0x48, 0x8b, 0x06, 0x48, 0x8d, 0x0c, 0xd0, 0x48, 0x8b, 0x04, 0xd0, 0x48, 0x8b, 0xf9, 0x48, 0x3b, 0xc1, 0x74, 0x17, 0x66, 0x90}},
-    {0x1406e9180ULL, 21, {0x44, 0x3b, 0x40, 0x10, 0x0f, 0x84, 0xe3, 0x00, 0x00, 0x00, 0x48, 0x8b, 0xf8, 0x48, 0x8b, 0x00, 0x48, 0x3b, 0xc1, 0x75, 0xeb}},
-    /* D7 SOS step after entry: r9=&guest */
-    {0x140680af5ULL, 24, {0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0x6c, 0x24, 0xf9, 0x48, 0x81, 0xec, 0xd0, 0x00, 0x00, 0x00, 0x48}},
-    {0x140680b0dULL, 24, {0x8b, 0x99, 0xf0, 0x01, 0x00, 0x00, 0x4c, 0x8b, 0xf1, 0x48, 0x8b, 0x45, 0x67, 0x4d, 0x8b, 0xf8, 0x4d, 0x8b, 0xe9, 0x4c, 0x8b, 0xe2, 0x4c, 0x8b}},
-    /* D7 caller: r9 = &[rbp+0x160] = guest id */
-    {0x14067fc9cULL, 24, {0x4d, 0x8b, 0xc4, 0x48, 0x8d, 0x45, 0xc8, 0x48, 0x89, 0x9d, 0x60, 0x01, 0x00, 0x00, 0x49, 0x8b, 0xd7, 0x48, 0x89, 0x44, 0x24, 0x20, 0x49, 0x8b}},
-    {0x14067fcb4ULL, 6, {0xce, 0xe8, 0x36, 0x0e, 0x00, 0x00}},
-    /* D8 recovery receiver after entry */
-    {0x1406a8ed5ULL, 24, {0x48, 0x89, 0x6c, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0x5a, 0x10, 0x33, 0xff, 0x48, 0x8b, 0x42}},
-    {0x1406a8eedULL, 8, {0x08, 0x48, 0x8b, 0xe9, 0x48, 0x8d, 0x04, 0xc3}},
-    /* D8: msg +0x18 group ; rec = [rbp+0x3b8]+idx*0x250 ; +0x1a == 0x0b ; +8 ; +9 */
-    {0x1406a8f10ULL, 24, {0x48, 0x8b, 0x03, 0x8b, 0x40, 0x18, 0x4c, 0x69, 0xc0, 0x50, 0x02, 0x00, 0x00, 0x4c, 0x03, 0x85, 0xb8, 0x03, 0x00, 0x00, 0x41, 0x80, 0x78, 0x1a}},
-    {0x1406a8f28ULL, 22, {0x0b, 0x75, 0x22, 0x41, 0x80, 0x78, 0x08, 0x00, 0x74, 0x1b, 0x41, 0x80, 0x78, 0x09, 0x00, 0x74, 0x14, 0x45, 0x33, 0xc9, 0x89, 0x44}},
-    /* D9 exit-behaviour after entry: r8 = record ; [r8+0x1b] ; [r8+0x50] */
+    {0x1406f0a1dULL, 18, {0x89, 0x44, 0x24, 0x30, 0x49, 0x8b, 0xd9, 0x49, 0x8b, 0xf8, 0xe8, 0x04, 0xd1, 0x9d, 0xff, 0x48, 0x8b, 0x08}},
+    /* P3 dispatcher stub: mov rcx,[rcx+8] (then jmp request receiver = site) */
+    {0x1406f2630ULL, 4, {0x48, 0x8b, 0x49, 0x08}},
+    /* request receiver: entry .. message 0 checks (reads mirrored by P3, all before its first call) */
+    {0x1406a8bc0ULL, 24, {0x40, 0x53, 0x56, 0x57, 0x41, 0x56, 0x48, 0x83, 0xec, 0x38, 0x48, 0x8b, 0x5a, 0x10, 0x33, 0xff, 0x48, 0x8b, 0x42, 0x08, 0x48, 0x8b, 0xf1, 0x48}},
+    {0x1406a8bd8ULL, 24, {0x8d, 0x04, 0xc3, 0x4c, 0x8b, 0xf0, 0x4c, 0x2b, 0xf3, 0x49, 0x83, 0xc6, 0x07, 0x49, 0xc1, 0xee, 0x03, 0x48, 0x3b, 0xd8, 0x4c, 0x0f, 0x47, 0xf7}},
+    {0x1406a8bf0ULL, 24, {0x4d, 0x85, 0xf6, 0x0f, 0x84, 0xc8, 0x00, 0x00, 0x00, 0x48, 0x89, 0x6c, 0x24, 0x60, 0x4c, 0x89, 0x64, 0x24, 0x70, 0x41, 0xbc, 0x42, 0x11, 0x00}},
+    {0x1406a8c08ULL, 24, {0x00, 0x4c, 0x89, 0x7c, 0x24, 0x30, 0x66, 0x90, 0x48, 0x8b, 0x2b, 0x48, 0x8b, 0x86, 0xb8, 0x03, 0x00, 0x00, 0x44, 0x8b, 0x55, 0x18, 0x4c, 0x8b}},
+    {0x1406a8c20ULL, 24, {0x5d, 0x38, 0x4d, 0x69, 0xfa, 0x50, 0x02, 0x00, 0x00, 0x41, 0x80, 0x7c, 0x07, 0x08, 0x00, 0x49, 0x8d, 0x0c, 0x07, 0x74, 0x6d, 0x0f, 0xb6, 0x41}},
+    {0x1406a8c38ULL, 24, {0x1a, 0x3c, 0x0c, 0x77, 0x65, 0x41, 0x0f, 0xa3, 0xc4, 0x73, 0x5f, 0x80, 0x79, 0x09, 0x00, 0x74, 0x59, 0x83, 0x7d, 0x1c, 0x02, 0x75, 0x23, 0x80}},
+    {0x1406a8c50ULL, 24, {0xb9, 0xd8, 0x00, 0x00, 0x00, 0x01, 0x75, 0x1a, 0x48, 0x8b, 0x8e, 0x58, 0x02, 0x00, 0x00, 0x48, 0x8d, 0x54, 0x24, 0x68, 0x44, 0x89, 0x54, 0x24}},
+    {0x1406a8c68ULL, 19, {0x68, 0xe8, 0x22, 0x53, 0x02, 0x00, 0x84, 0xc0, 0x75, 0x30, 0x4c, 0x3b, 0x9e, 0x50, 0x9a, 0x00, 0x00, 0x74, 0x27}},
+    /* P4 physics start after entry .. call group lookup */
+    {0x14067d455ULL, 24, {0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 0x48, 0x4c, 0x8b, 0xe2, 0x48, 0x8b, 0xe9, 0x48, 0x81}},
+    {0x14067d46dULL, 16, {0xc1, 0x48, 0x02, 0x00, 0x00, 0x49, 0x8b, 0xd0, 0x49, 0x8b, 0xd8, 0xe8, 0x93, 0xbc, 0x06, 0x00}},
+    /* group lookup callee prologue .. mov r8d,[rdx] (first memory read of the key) */
+    {0x1406e9110ULL, 19, {0x48, 0x89, 0x74, 0x24, 0x18, 0x48, 0x89, 0x7c, 0x24, 0x20, 0x41, 0x56, 0x48, 0x83, 0xec, 0x30, 0x44, 0x8b, 0x02}},
+    /* P5 SOS step after entry */
+    {0x140680af5ULL, 23, {0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0x6c, 0x24, 0xf9, 0x48, 0x81, 0xec, 0xd0, 0x00, 0x00, 0x00}},
+    /* P5 caller: r9 = &[rbp+0x160] (guest id on the caller's stack) */
+    {0x14067fc89ULL, 24, {0x4c, 0x8d, 0x8d, 0x60, 0x01, 0x00, 0x00, 0x48, 0x8d, 0x45, 0xc4, 0x89, 0x75, 0xc8, 0x48, 0x89, 0x44, 0x24, 0x28, 0x4d, 0x8b, 0xc4, 0x48, 0x8d}},
+    {0x14067fca1ULL, 24, {0x45, 0xc8, 0x48, 0x89, 0x9d, 0x60, 0x01, 0x00, 0x00, 0x49, 0x8b, 0xd7, 0x48, 0x89, 0x44, 0x24, 0x20, 0x49, 0x8b, 0xce, 0xe8, 0x36, 0x0e, 0x00}},
+    {0x14067fcb9ULL, 1, {0x00}},
+    /* P6 dispatcher stub: mov rcx,[rcx+8] (then jmp recovery receiver = site) */
+    {0x1406f2590ULL, 4, {0x48, 0x8b, 0x49, 0x08}},
+    /* recovery receiver: entry .. call exit-behaviour (reads mirrored by P6) */
+    {0x1406a8ed0ULL, 24, {0x48, 0x89, 0x5c, 0x24, 0x08, 0x48, 0x89, 0x6c, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0x5a, 0x10}},
+    {0x1406a8ee8ULL, 24, {0x33, 0xff, 0x48, 0x8b, 0x42, 0x08, 0x48, 0x8b, 0xe9, 0x48, 0x8d, 0x04, 0xc3, 0x48, 0x8b, 0xf0, 0x48, 0x2b, 0xf3, 0x48, 0x83, 0xc6, 0x07, 0x48}},
+    {0x1406a8f00ULL, 24, {0xc1, 0xee, 0x03, 0x48, 0x3b, 0xd8, 0x48, 0x0f, 0x47, 0xf7, 0x48, 0x85, 0xf6, 0x74, 0x4a, 0x90, 0x48, 0x8b, 0x03, 0x8b, 0x40, 0x18, 0x4c, 0x69}},
+    {0x1406a8f18ULL, 24, {0xc0, 0x50, 0x02, 0x00, 0x00, 0x4c, 0x03, 0x85, 0xb8, 0x03, 0x00, 0x00, 0x41, 0x80, 0x78, 0x1a, 0x0b, 0x75, 0x22, 0x41, 0x80, 0x78, 0x08, 0x00}},
+    {0x1406a8f30ULL, 24, {0x74, 0x1b, 0x41, 0x80, 0x78, 0x09, 0x00, 0x74, 0x14, 0x45, 0x33, 0xc9, 0x89, 0x44, 0x24, 0x38, 0x48, 0x8d, 0x54, 0x24, 0x38, 0x48, 0x8b, 0xcd}},
+    {0x1406a8f48ULL, 5, {0xe8, 0x73, 0x3f, 0xff, 0xff}},
+    /* P7 exit behaviour after entry .. [r8+0x1b], [r8+0x50] read before its first call */
     {0x14069cec5ULL, 24, {0x55, 0x56, 0x57, 0x41, 0x55, 0x41, 0x56, 0x48, 0x8b, 0xec, 0x48, 0x83, 0xec, 0x60, 0x41, 0x80, 0x78, 0x1b, 0x00, 0x45, 0x0f, 0xb6, 0xf1, 0x49}},
     {0x14069ceddULL, 24, {0x8b, 0xf0, 0x4c, 0x8b, 0xea, 0x48, 0x8b, 0xf9, 0x74, 0x35, 0x49, 0x83, 0x78, 0x50, 0xff, 0x74, 0x2a, 0x48, 0x8b, 0x89, 0x98, 0x01, 0x00, 0x00}},
-    {0x14069cef5ULL, 2, {0x49, 0x8d}},
-    /* D9: behaviour switch on [rsi+0x1a] */
-    {0x14069cf9fULL, 24, {0x0f, 0xb6, 0x46, 0x1a, 0x48, 0x8d, 0x15, 0x56, 0x30, 0x96, 0xff, 0x4c, 0x89, 0xbc, 0x24, 0xa0, 0x00, 0x00, 0x00, 0xc6, 0x86, 0x4e, 0x02, 0x00}},
-    {0x14069cfb7ULL, 2, {0x00, 0x00}},
-    /* D10 purge after entry */
-    {0x14081a0a5ULL, 24, {0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xa8, 0x18, 0xfd, 0xff, 0xff, 0x48, 0x81, 0xec, 0xa8, 0x03, 0x00, 0x00}},
-    /* D10: mov rsi,[rdx+0x18] */
-    {0x14081a0bdULL, 4, {0x48, 0x8b, 0x72, 0x18}},
-    /* D10: mov rax,[rdx+0x10] */
-    {0x14081a0faULL, 4, {0x48, 0x8b, 0x42, 0x10}},
+    {0x14069cef5ULL, 8, {0x49, 0x8d, 0x50, 0x50, 0x48, 0x83, 0xc1, 0x08}},
+    /* enter-Physics: unconditional call to exit behaviour (return address 0x14069c8d1) */
+    {0x14069c8b3ULL, 24, {0x8b, 0x02, 0x49, 0x8b, 0xd9, 0x4c, 0x8b, 0xea, 0x41, 0x89, 0x43, 0x10, 0x45, 0x33, 0xc9, 0x49, 0x8d, 0x53, 0x10, 0x4d, 0x8b, 0xf0, 0x4c, 0x8b}},
+    {0x14069c8cbULL, 6, {0xf9, 0xe8, 0xef, 0x05, 0x00, 0x00}},
+    /* P8 script binding: builds the id vector on its stack, then call purge = site */
+    {0x14046c08cULL, 13, {0xe8, 0x2f, 0x55, 0xcf, 0xff, 0x48, 0x8d, 0x54, 0x24, 0x20, 0x48, 0x8b, 0xcb}},
+    /* P9 station purge: builds the id vector, then call purge = site */
+    {0x140856a79ULL, 13, {0xe8, 0x42, 0xab, 0x90, 0xff, 0x48, 0x8d, 0x54, 0x24, 0x20, 0x48, 0x8b, 0xcb}},
+    /* purge: entry .. reads [rdx+0x18], [rdx+0x10], first id (before its first call) */
+    {0x14081a0a0ULL, 24, {0x48, 0x8b, 0xc4, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0xa8, 0x18, 0xfd, 0xff, 0xff, 0x48, 0x81}},
+    {0x14081a0b8ULL, 24, {0xec, 0xa8, 0x03, 0x00, 0x00, 0x48, 0x8b, 0x72, 0x18, 0x45, 0x33, 0xff, 0xf3, 0x0f, 0x10, 0x05, 0x38, 0x51, 0x22, 0x01, 0x4c, 0x8b, 0xe9, 0x0f}},
+    {0x14081a0d0ULL, 24, {0x29, 0x70, 0xa8, 0x45, 0x8b, 0xcf, 0x0f, 0x29, 0x78, 0x98, 0x45, 0x8b, 0xd7, 0x44, 0x0f, 0x29, 0x40, 0x88, 0x44, 0x0f, 0x29, 0x88, 0x78, 0xff}},
+    {0x14081a0e8ULL, 24, {0xff, 0xff, 0x44, 0x0f, 0x29, 0x90, 0x68, 0xff, 0xff, 0xff, 0x44, 0x0f, 0x29, 0x98, 0x58, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x42, 0x10, 0xf3, 0x0f}},
+    {0x14081a100ULL, 24, {0x11, 0x44, 0x24, 0x70, 0x4c, 0x89, 0x7c, 0x24, 0x60, 0x4c, 0x89, 0x7c, 0x24, 0x58, 0x4c, 0x8d, 0x34, 0xc6, 0x4c, 0x89, 0x7c, 0x24, 0x68, 0x48}},
+    {0x14081a118ULL, 24, {0x89, 0x74, 0x24, 0x40, 0x4c, 0x89, 0x75, 0x80, 0x49, 0x3b, 0xf6, 0x0f, 0x84, 0x5c, 0x06, 0x00, 0x00, 0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00}},
+    {0x14081a130ULL, 4, {0x48, 0x8b, 0x0e, 0x48}},
 };
 
 /* ---- event ring (hooks write, script thread reads) --------------------------------------- */
-enum {
-    K_IMPACT = 1, K_POST, K_REQUEST, K_ENTER, K_MEMBER, K_LAUNCH, K_GUESTMAP, K_GROUPKEY, K_SOS,
-    K_RECOVER, K_EXITPHYS, K_EXITMEMBER, K_PURGE, K_UNTRACKED, K_KINDS
-};
+enum { K_IMPACT = 1, K_POST, K_REQUEST, K_LAUNCH, K_SOS, K_RECOVER, K_EXIT, K_PURGE, K_KINDS };
 struct pd_ev { volatile uint64_t seq; uint32_t kind, tid; uint64_t t, ret, a, b, c, d, e; };
-#define PD_RING 1024                /* power of two */
+#define PD_RING 1024
 static struct pd_ev g_pd_ring[PD_RING];
 static volatile uint64_t g_pd_head;
-static uint64_t g_pd_tail;          /* script thread */
-static volatile long g_pd_counts[K_KINDS];
+static uint64_t g_pd_tail;
 static uint64_t g_pd_t0;
 static long g_pd_printed;
 #define PD_PRINT_BUDGET 5000
@@ -195,7 +171,6 @@ static volatile int g_pd_on;
 static void pd_event(uint32_t kind, uint64_t ret, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e)
 {
     if (!g_pd_on || kind >= K_KINDS) return;
-    __sync_fetch_and_add(&g_pd_counts[kind], 1);
     uint64_t i = __sync_fetch_and_add(&g_pd_head, 1);
     struct pd_ev *v = &g_pd_ring[i & (PD_RING - 1)];
     v->seq = 0;
@@ -206,9 +181,9 @@ static void pd_event(uint32_t kind, uint64_t ret, uint64_t a, uint64_t b, uint64
     v->seq = i + 1;
 }
 
-/* ---- ids handed to the scripts (groups and guests to cross-check) ------------------------- */
+/* ids for the scripts (kind 1 = group index, 2 = guest id) */
 #define PD_ITEMS 128
-static volatile uint64_t g_pd_items[PD_ITEMS];   /* value << 2 | kind (1 group, 2 guest); 0 = empty */
+static volatile uint64_t g_pd_items[PD_ITEMS];
 static volatile uint64_t g_pd_items_head;
 static uint64_t g_pd_items_tail;
 static void pd_item(uint64_t kind, uint64_t value)
@@ -218,8 +193,36 @@ static void pd_item(uint64_t kind, uint64_t value)
     g_pd_items[i & (PD_ITEMS - 1)] = (value << 2) | kind;
 }
 
-/* ---- read-only lookups with the game's hash functions and node layouts (fingerprinted) ---- */
-/* buckets at m[0], bucket count m[1]; node: next [+0], 64-bit key [+8]; returns node or 0 */
+/* groups of interest (filled from observed request/recovery/launch ids; read by the exit hook) */
+#define PD_GROUPS 32
+static volatile uint64_t g_pd_groups[PD_GROUPS];   /* idx + 1, 0 = empty */
+static void pd_group_add(uint64_t idx)
+{
+    for (int i = 0; i < PD_GROUPS; i++) if (g_pd_groups[i] == idx + 1) return;
+    for (int i = 0; i < PD_GROUPS; i++)
+        if (__sync_bool_compare_and_swap(&g_pd_groups[i], 0, idx + 1)) { pd_item(1, idx); return; }
+}
+static int pd_group_known(uint64_t idx)
+{
+    for (int i = 0; i < PD_GROUPS; i++) if (g_pd_groups[i] == idx + 1) return 1;
+    return 0;
+}
+
+/* ---- read helpers -------------------------------------------------------------------------- */
+#define RD8(p)  (*(const uint8_t *)(uintptr_t)(p))
+#define RD32(p) (*(const uint32_t *)(uintptr_t)(p))
+#define RD64(p) (*(const uint64_t *)(uintptr_t)(p))
+
+/* (b) current thread's stack: NT_TIB StackBase gs:[8], StackLimit gs:[0x10] */
+static int pd_on_my_stack(uint64_t p, uint64_t size)
+{
+    uint64_t base, limit;
+    __asm__ volatile("mov %%gs:0x8, %0" : "=r"(base));
+    __asm__ volatile("mov %%gs:0x10, %0" : "=r"(limit));
+    return p >= limit && p + size <= base && p + size > p;
+}
+
+/* game hash lookups, read-only (fingerprinted; checked against the game's code in an emulator) */
 static const uint64_t *pd_find64(const uint64_t *m, uint64_t key)
 {
     const uint64_t *buckets = (const uint64_t *)(uintptr_t)m[0];
@@ -235,7 +238,6 @@ static const uint64_t *pd_find64(const uint64_t *m, uint64_t key)
     }
     return 0;
 }
-/* 32-bit key at node + keyoff */
 static const uint64_t *pd_find32(const uint64_t *m, uint32_t key, int keyoff)
 {
     const uint64_t *buckets = (const uint64_t *)(uintptr_t)m[0];
@@ -252,218 +254,166 @@ static const uint64_t *pd_find32(const uint64_t *m, uint32_t key, int keyoff)
     return 0;
 }
 
-#define RD8(p)  (*(const uint8_t *)(uintptr_t)(p))
-#define RD32(p) (*(const uint32_t *)(uintptr_t)(p))
-#define RD64(p) (*(const uint64_t *)(uintptr_t)(p))
-
-/* behaviours accepted by the entry rule (bit mask 0x1142: Navigating, AtShop, AtEntertainer, AtSecurityGuard) */
 static int pd_beh_ok(uint8_t beh) { return beh <= 0xc && ((0x1142u >> beh) & 1); }
-
-/* packed entry-check values: f8 | f9<<8 | beh<<16 | d8<<24 | srcEq<<32 | pending<<33(2 bits) | pred<<36(2) | found<<38 | leader<<39 */
 enum { PRED_REJECT = 0, PRED_ACCEPT = 1, PRED_EXTRA = 2, PRED_NA = 3 };
+#define NOTREAD 0xffffffffffffffffULL
 
-/* ---- hook bodies: regs [0]=r9 [1]=r8 [2]=rdx [3]=rcx [4]=return address [9]=5th arg [10]=6th arg ---- */
-#define PD_MAX_MSG 8
+/* ---- hook bodies: regs [0]=r9 [1]=r8 [2]=rdx [3]=rcx [4]=return address [4+k]=[entry rsp + 8k] ----
+ * Each body mirrors, in the same order, only the reads the observed routine makes on this call
+ * before its first call or synchronisation (see the offline read-path check). Message lists: only
+ * message 0 is examined (later messages are read by the game after calls). */
+
+/* P1 impact receiver 0x1406b58b0 (rcx = system, rdx = message list) */
 void pd_b_impact(const uint64_t *r)
 {
     uint64_t sys = r[3], vec = r[2];
-    if (!sys || !vec) return;
     uint64_t data = RD64(vec + 0x10), cnt = RD64(vec + 8);
-    for (uint64_t i = 0; i < cnt && i < PD_MAX_MSG; i++) {
-        uint64_t msg = RD64(data + 8 * i);
-        if (!msg) continue;
-        uint64_t guest = RD64(msg + 0x18), reason = RD32(msg + 0x38), src = RD64(msg + 0x40);
-        uint64_t idx = 0xffffffffULL, packed = (uint64_t)PRED_NA << 36;
-        const uint64_t *node = pd_find64((const uint64_t *)(uintptr_t)(sys + 0x218), guest);
-        if (node) {
-            idx = RD32((uint64_t)(uintptr_t)node + 0x10);
-            packed = 1ULL << 38;
-            if (RD64(RD64(sys + 0x288) + idx * 8) == guest) {
-                packed |= 1ULL << 39;
-                uint64_t gm = RD64(sys + 0x1d0);
-                uint64_t rec = RD64(gm + 0x3b8) + idx * 0x250;
-                uint8_t f8 = RD8(rec + 8), beh = 0, f9 = 0, d8 = 0;
-                int pred = PRED_REJECT, srcEq = 0, pend = 0;
-                if (f8) {
-                    beh = RD8(rec + 0x1a);
-                    if (pd_beh_ok(beh)) {
-                        f9 = RD8(rec + 9);
-                        if (f9) {
-                            int extra = 0;
-                            if (reason == 2) { d8 = RD8(rec + 0xd8); extra = d8 == 1; }
+    if (!cnt) return;
+    uint64_t msg = RD64(data);
+    uint64_t guest = RD64(msg + 0x18);
+    uint64_t idx = NOTREAD, packed = (uint64_t)PRED_NA << 36, reason = NOTREAD, src = NOTREAD;
+    const uint64_t *node = pd_find64((const uint64_t *)(uintptr_t)(sys + 0x218), guest);
+    if (node) {
+        idx = RD32((uint64_t)(uintptr_t)node + 0x10);
+        packed = 1ULL << 38;                                   /* found */
+        if (RD64(RD64(sys + 0x288) + idx * 8) == guest) {
+            packed |= 1ULL << 39;                              /* per-group entry matches */
+            uint64_t gm = RD64(sys + 0x1d0);
+            uint64_t rec = RD64(gm + 0x3b8) + idx * 0x250;
+            uint8_t f8 = RD8(rec + 8), beh = 0, f9 = 0, d8 = 0;
+            int pred = PRED_REJECT, srcEq = 0, pend = 0;
+            if (f8) {
+                beh = RD8(rec + 0x1a);
+                if (pd_beh_ok(beh)) {
+                    f9 = RD8(rec + 9);
+                    if (f9) {
+                        reason = RD32(msg + 0x38);
+                        if (reason == 2) d8 = RD8(rec + 0xd8);
+                        if (reason == 2 && d8 == 1) {
+                            pred = PRED_EXTRA;                 /* the game calls 0x1406cdf90 here: stop reading */
+                        } else {
+                            src = RD64(msg + 0x40);
                             srcEq = src == RD64(gm + 0x9a50);
                             if (!srcEq) {
                                 if (RD64(sys + 0x250)) pend = pd_find32((const uint64_t *)(uintptr_t)(sys + 0x238), (uint32_t)idx, 8) ? 1 : 0;
                                 else pend = 2;
-                                pred = extra ? PRED_EXTRA : (pend == 1 ? PRED_REJECT : PRED_ACCEPT);
+                                pred = pend == 1 ? PRED_REJECT : PRED_ACCEPT;
                             }
                         }
                     }
                 }
-                packed |= (uint64_t)f8 | ((uint64_t)f9 << 8) | ((uint64_t)beh << 16) | ((uint64_t)d8 << 24) |
-                          ((uint64_t)srcEq << 32) | ((uint64_t)pend << 33) | ((uint64_t)pred << 36);
             }
+            packed |= (uint64_t)f8 | ((uint64_t)f9 << 8) | ((uint64_t)beh << 16) | ((uint64_t)d8 << 24) |
+                      ((uint64_t)srcEq << 32) | ((uint64_t)pend << 33) | ((uint64_t)pred << 36);
         }
-        pd_event(K_IMPACT, r[4], guest, idx, reason, src, packed);
-        pd_item(2, guest);
     }
+    pd_event(K_IMPACT, r[4], guest, idx, reason, src, packed | (cnt > 1 ? 1ULL << 40 : 0));
+    pd_item(2, guest);
 }
 
+/* P2 post group request 0x1406f0a00 (rdx = &group index on the caller's stack) */
 void pd_b_post(const uint64_t *r)
 {
-    uint64_t idx = r[2] ? RD32(r[2]) : 0xffffffffULL;
-    uint64_t reason = r[9] ? RD32(r[9]) : 0, src = r[10] ? RD64(r[10]) : 0;
-    pd_event(K_POST, r[4], idx, reason, src, 0, 0);
+    uint64_t idx = pd_on_my_stack(r[2], 4) ? RD32(r[2]) : NOTREAD;
+    pd_event(K_POST, r[4], idx, 0, 0, 0, 0);
+    if (idx != NOTREAD) pd_group_add(idx);
 }
 
+/* P3 request receiver 0x1406a8bc0 (rcx = guest manager, rdx = message list) */
 void pd_b_request(const uint64_t *r)
 {
     uint64_t gm = r[3], vec = r[2];
-    if (!gm || !vec) return;
     uint64_t data = RD64(vec + 0x10), cnt = RD64(vec + 8);
-    for (uint64_t i = 0; i < cnt && i < PD_MAX_MSG; i++) {
-        uint64_t msg = RD64(data + 8 * i);
-        if (!msg) continue;
-        uint64_t idx = RD32(msg + 0x18), reason = RD32(msg + 0x1c), src = RD64(msg + 0x38);
-        uint64_t rec = RD64(gm + 0x3b8) + idx * 0x250;
-        uint8_t f8 = RD8(rec + 8), beh = 0, f9 = 0, d8 = 0;
-        int pred = PRED_REJECT, srcEq = 0;
-        if (f8) {
-            beh = RD8(rec + 0x1a);
-            if (pd_beh_ok(beh)) {
-                f9 = RD8(rec + 9);
-                if (f9) {
-                    int extra = 0;
-                    if (reason == 2) { d8 = RD8(rec + 0xd8); extra = d8 == 1; }
-                    srcEq = src == RD64(gm + 0x9a50);
-                    if (!srcEq) pred = extra ? PRED_EXTRA : PRED_ACCEPT;
-                }
+    if (!cnt) return;
+    uint64_t msg = RD64(data);
+    uint64_t idx = RD32(msg + 0x18), src = RD64(msg + 0x38);
+    uint64_t rec = RD64(gm + 0x3b8) + idx * 0x250;
+    uint8_t f8 = RD8(rec + 8), beh = 0, f9 = 0, d8 = 0;
+    uint64_t reason = NOTREAD;
+    int pred = PRED_REJECT, srcEq = 0;
+    if (f8) {
+        beh = RD8(rec + 0x1a);
+        if (pd_beh_ok(beh)) {
+            f9 = RD8(rec + 9);
+            if (f9) {
+                reason = RD32(msg + 0x1c);
+                if (reason == 2) d8 = RD8(rec + 0xd8);
+                if (reason == 2 && d8 == 1) pred = PRED_EXTRA;
+                else { srcEq = src == RD64(gm + 0x9a50); if (!srcEq) pred = PRED_ACCEPT; }
             }
         }
-        uint64_t packed = (uint64_t)f8 | ((uint64_t)f9 << 8) | ((uint64_t)beh << 16) | ((uint64_t)d8 << 24) |
-                          ((uint64_t)srcEq << 32) | ((uint64_t)pred << 36);
-        pd_event(K_REQUEST, r[4], idx, reason, src, 0, packed);
     }
+    uint64_t packed = (uint64_t)f8 | ((uint64_t)f9 << 8) | ((uint64_t)beh << 16) | ((uint64_t)d8 << 24) |
+                      ((uint64_t)srcEq << 32) | ((uint64_t)pred << 36) | (cnt > 1 ? 1ULL << 40 : 0);
+    pd_event(K_REQUEST, r[4], idx, reason, src, 0, packed);
+    pd_group_add(idx);
 }
 
-#define PD_MAX_MEMBERS 16
-void pd_b_enter(const uint64_t *r)
-{
-    uint64_t gm = r[3], rec = r[1];
-    if (!gm || !rec || !r[2]) return;
-    uint64_t idx = RD32(r[2]);
-    uint32_t first = RD32(rec), end = RD32(rec + 4);
-    uint64_t reason = (uint32_t)r[9];          /* 5th argument passed by value */
-    pd_event(K_ENTER, r[4], idx, RD8(rec + 0x1a), reason, (uint64_t)(end - first), first);
-    pd_item(1, idx);
-    uint64_t arr = RD64(gm + 0x3b0);
-    for (uint32_t m = first, k = 0; m != end && k < PD_MAX_MEMBERS; m++, k++)
-        pd_event(K_MEMBER, r[4], idx, RD64(arr + (uint64_t)m * 0x30 + 8), k, 0, 0);
-}
-
-/* tracking of launched guests for confirmed state changes (written by launch hook, read by update hook) */
-#define PD_TRACK 64
-struct pd_track { volatile long used; uint64_t guest; uint32_t key; int in_map, key_present; uint64_t since, left_at; };
-static struct pd_track g_pd_track[PD_TRACK];
-
+/* P4 physics start 0x14067d450 (rdx = &guest id, r8 = &{group key, ...}) */
 void pd_b_launch(const uint64_t *r)
 {
-    uint64_t guest = r[2] ? RD64(r[2]) : 0, key = r[1] ? RD32(r[1]) : 0xffffffffULL;
+    uint64_t key = RD32(r[1]);                                /* first memory read of the routine's first callee */
+    uint64_t guest = pd_on_my_stack(r[2], 8) ? RD64(r[2]) : NOTREAD;
     pd_event(K_LAUNCH, r[4], guest, key, 0, 0, 0);
-    pd_item(2, guest);
-    for (int i = 0; i < PD_TRACK; i++) {
-        struct pd_track *t = &g_pd_track[i];
-        if (t->used == 2 && t->guest == guest) return;
-    }
-    for (int i = 0; i < PD_TRACK; i++) {
-        struct pd_track *t = &g_pd_track[i];
-        if (__sync_bool_compare_and_swap(&t->used, 0, 1)) {
-            t->guest = guest; t->key = (uint32_t)key; t->in_map = -2; t->key_present = -2;
-            t->since = GetTickCount64(); t->left_at = 0;
-            __sync_synchronize();
-            t->used = 2;
-            return;
-        }
-    }
-    pd_event(K_UNTRACKED, r[4], guest, key, 0, 0, 0);
+    pd_group_add(key);
+    if (guest != NOTREAD) pd_item(2, guest);
 }
 
-void pd_b_update(const uint64_t *r)
-{
-    uint64_t sys = r[3];
-    if (!sys) return;
-    uint64_t now = GetTickCount64();
-    for (int i = 0; i < PD_TRACK; i++) {
-        struct pd_track *t = &g_pd_track[i];
-        if (t->used != 2) continue;
-        const uint64_t *gnode = pd_find64((const uint64_t *)(uintptr_t)(sys + 0x228), t->guest);
-        int in = gnode ? 1 : 0;
-        int kp = pd_find32((const uint64_t *)(uintptr_t)(sys + 0x248), t->key, 0x10) ? 1 : 0;
-        if (in != t->in_map) {
-            pd_event(K_GUESTMAP, 0, t->guest, (uint64_t)in, t->key, RD32(sys + 0x290), RD64(sys + 0x288));
-            t->in_map = in;
-            if (!in) t->left_at = now;
-        }
-        if (kp != t->key_present) {
-            pd_event(K_GROUPKEY, 0, t->key, (uint64_t)kp, t->guest, 0, 0);
-            t->key_present = kp;
-        }
-        /* stop tracking 30 s after the guest left the physics guest map, or after 10 minutes */
-        if ((t->left_at && now - t->left_at > 30000) || now - t->since > 600000) t->used = 0;
-    }
-}
-
+/* P5 SOS step 0x140680af0 (r9 = &guest id on the caller's stack) */
 void pd_b_sos(const uint64_t *r)
 {
-    pd_event(K_SOS, r[4], r[0] ? RD64(r[0]) : 0, 0, 0, 0, 0);
+    uint64_t guest = pd_on_my_stack(r[0], 8) ? RD64(r[0]) : NOTREAD;
+    pd_event(K_SOS, r[4], guest, 0, 0, 0, 0);
+    if (guest != NOTREAD) pd_item(2, guest);
 }
 
+/* P6 recovery receiver 0x1406a8ed0 (rcx = guest manager, rdx = message list) */
 void pd_b_recover(const uint64_t *r)
 {
     uint64_t gm = r[3], vec = r[2];
-    if (!gm || !vec) return;
     uint64_t data = RD64(vec + 0x10), cnt = RD64(vec + 8);
-    for (uint64_t i = 0; i < cnt && i < PD_MAX_MSG; i++) {
-        uint64_t msg = RD64(data + 8 * i);
-        if (!msg) continue;
-        uint64_t idx = RD32(msg + 0x18);
-        uint64_t rec = RD64(gm + 0x3b8) + idx * 0x250;
-        uint8_t beh = RD8(rec + 0x1a), f8 = 0, f9 = 0;
-        int proceed = 0;
-        if (beh == 0x0b) { f8 = RD8(rec + 8); if (f8) { f9 = RD8(rec + 9); proceed = f9 != 0; } }
-        pd_event(K_RECOVER, r[4], idx, beh, f8, f9, (uint64_t)proceed);
-    }
+    if (!cnt) return;
+    uint64_t msg = RD64(data);
+    uint64_t idx = RD32(msg + 0x18);
+    uint64_t rec = RD64(gm + 0x3b8) + idx * 0x250;
+    uint8_t beh = RD8(rec + 0x1a), f8 = 0, f9 = 0;
+    int proceed = 0;
+    if (beh == 0x0b) { f8 = RD8(rec + 8); if (f8) { f9 = RD8(rec + 9); proceed = f9 != 0; } }
+    pd_event(K_RECOVER, r[4], idx, beh, f8, f9, (uint64_t)proceed | (cnt > 1 ? 2 : 0));
+    pd_group_add(idx);
 }
 
+/* P7 exit behaviour 0x14069cec0 (rdx = &group index, r8 = group record); logged only when called by
+ * enter-Physics or by the recovery receiver, or for a group already of interest */
+#define RET_FROM_ENTER   0x14069c8d1ULL
+#define RET_FROM_RECOVER 0x1406a8f4dULL
 void pd_b_exit(const uint64_t *r)
 {
-    uint64_t gm = r[3], rec = r[1];
-    if (!gm || !rec || !r[2]) return;
-    if (RD8(rec + 0x1a) != 0x0b) return;             /* only groups leaving Physics */
-    uint64_t idx = RD32(r[2]);
-    uint32_t first = RD32(rec), end = RD32(rec + 4);
-    pd_event(K_EXITPHYS, r[4], idx, (uint64_t)(end - first), RD8(rec + 0x1b), RD64(rec + 0x50), r[0] & 0xff);
-    uint64_t arr = RD64(gm + 0x3b0);
-    for (uint32_t m = first, k = 0; m != end && k < PD_MAX_MEMBERS; m++, k++)
-        pd_event(K_EXITMEMBER, r[4], idx, RD64(arr + (uint64_t)m * 0x30 + 8), k, 0, 0);
+    uint64_t idx = pd_on_my_stack(r[2], 4) ? RD32(r[2]) : NOTREAD;
+    int interesting = r[4] == RET_FROM_ENTER || r[4] == RET_FROM_RECOVER || (idx != NOTREAD && pd_group_known(idx));
+    if (!interesting) return;
+    uint64_t rec = r[1];
+    uint8_t f1b = RD8(rec + 0x1b);                           /* read by the routine first */
+    uint64_t handle = f1b ? RD64(rec + 0x50) : NOTREAD;      /* read next, only when +0x1b != 0 */
+    pd_event(K_EXIT, r[4], idx, f1b, handle, r[0] & 0xff, 0);
+    if (idx != NOTREAD) pd_group_add(idx);
 }
 
+/* P8/P9 purge 0x14081a0a0 via its callers (rdx = id vector) */
 void pd_b_purge(const uint64_t *r)
 {
-    uint64_t v = r[2], n = 0, first = 0;
-    if (v) {
-        n = RD64(v + 0x10);
-        uint64_t data = RD64(v + 0x18);
-        if (data && n > 0) first = RD64(data);
-    }
+    uint64_t v = r[2];
+    uint64_t data = RD64(v + 0x18), n = RD64(v + 0x10), first = 0;
+    if (n) first = RD64(data);
     pd_event(K_PURGE, r[4], n, first, 0, 0, 0);
 }
 
 /* ---- wrappers ----------------------------------------------------------------------------
- * Entered by `jmp` from the patched entry, so rsp is exactly the entry rsp ([rsp] = return address,
- * 8 mod 16). Saves rcx, rdx, r8, r9 (argument registers) and xmm0-xmm3; the C body may change only
- * the volatile registers rax, r10, r11, xmm4, xmm5 and the flags, none of which the hooked routines
- * read before writing (verified offline). Stack after the pushes and sub is 16-byte aligned for the call. */
+ * Entered by jmp (ENTRY: from the patched entry; REDIRECT: from the re-targeted jmp/call), so the
+ * stack is exactly as at the observed routine's entry ([rsp] = return address, rsp = 8 mod 16).
+ * Saves rcx, rdx, r8, r9 and xmm0-xmm3; the body may change only rax, r10, r11, xmm4, xmm5 and
+ * the flags, which the observed routines do not read before writing (offline check). Ends with a
+ * jump through g_pd_tramp[i] (ENTRY: trampoline; REDIRECT: original destination). */
 #define PD_WRAPPER(name, body, tramp) \
     __asm__(".intel_syntax noprefix\n.text\n.globl " #name "\n" #name ":\n" \
             "    push rcx\n    push rdx\n    push r8\n    push r9\n" \
@@ -483,38 +433,86 @@ void *g_pd_tramp[PD_NSITES];
 PD_W(0, pd_w_impact, pd_b_impact);
 PD_W(1, pd_w_post, pd_b_post);
 PD_W(2, pd_w_request, pd_b_request);
-PD_W(3, pd_w_enter, pd_b_enter);
-PD_W(4, pd_w_launch, pd_b_launch);
-PD_W(5, pd_w_update, pd_b_update);
-PD_W(6, pd_w_sos, pd_b_sos);
-PD_W(7, pd_w_recover, pd_b_recover);
-PD_W(8, pd_w_exit, pd_b_exit);
-PD_W(9, pd_w_purge, pd_b_purge);
+PD_W(3, pd_w_launch, pd_b_launch);
+PD_W(4, pd_w_sos, pd_b_sos);
+PD_W(5, pd_w_recover, pd_b_recover);
+PD_W(6, pd_w_exit, pd_b_exit);
+PD_W(7, pd_w_purge_script, pd_b_purge);
+PD_W(8, pd_w_purge_station, pd_b_purge);
 
-/* ---- stub page: per site i, stub at 0x40*i (jmp [rip+0] -> wrapper), trampoline at 0x40*i+0x20
- * (original n bytes, then jmp [rip+0] -> site+n). Pure function of its inputs (tested offline). */
+/* ---- stub page: site i -> stub at 0x40*i (jmp [rip+0] -> wrapper); ENTRY trampoline at
+ * 0x40*i+0x20 (original instruction, jmp [rip+0] -> site+n). Also computes the patch bytes and the
+ * jump slots. Pure function of its inputs (tested offline). */
 static void pd_put_abs_jmp(uint8_t *p, uint64_t target)
 {
     p[0] = 0xff; p[1] = 0x25; p[2] = p[3] = p[4] = p[5] = 0;
     for (int i = 0; i < 8; i++) p[6 + i] = (uint8_t)(target >> (8 * i));
 }
-static int pd_build_page(uint8_t *page, uint64_t page_va, const uint64_t *wrappers, struct pdsite *sites, int nsites)
+static int pd_build_page(uint8_t *page, uint64_t page_va, const uint64_t *wrappers, struct pdsite *sites, int nsites,
+                         uint64_t *slots)
 {
     for (int i = 0; i < nsites; i++) {
         struct pdsite *s = &sites[i];
-        uint8_t *stub = page + 0x40 * i, *tr = stub + 0x20;
+        if (s->n != 5) return 0;
+        uint8_t *stub = page + 0x40 * i;
         pd_put_abs_jmp(stub, wrappers[i]);
-        for (int k = 0; k < s->n; k++) tr[k] = s->orig[k];
-        pd_put_abs_jmp(tr + s->n, s->va + (uint64_t)s->n);
         int64_t rel = (int64_t)(page_va + 0x40 * (uint64_t)i) - (int64_t)(s->va + 5);
         if (rel > 0x7fffffffLL || rel < -0x80000000LL) return 0;
-        s->patch[0] = 0xe9;
+        if (s->kind == PK_ENTRY) {
+            uint8_t *tr = stub + 0x20;
+            for (int k = 0; k < 5; k++) tr[k] = s->orig[k];
+            pd_put_abs_jmp(tr + 5, s->va + 5);
+            slots[i] = page_va + 0x40 * (uint64_t)i + 0x20;
+            s->patch[0] = 0xe9;                                    /* jmp stub */
+        } else {
+            slots[i] = s->target;
+            s->patch[0] = s->orig[0];                              /* same opcode (e8 call / e9 jmp), new target */
+        }
         for (int k = 0; k < 4; k++) s->patch[1 + k] = (uint8_t)((uint64_t)rel >> (8 * k));
-        if (s->n == 6) s->patch[5] = 0x90;
-        else if (s->n == 7) { s->patch[5] = 0x66; s->patch[6] = 0x90; }
-        else if (s->n != 5) return 0;
     }
     return 1;
+}
+
+/* ---- atomic single-instruction swap within one aligned 8- or 16-byte unit -------------------- */
+static int pd_swap(const struct pdsite *s, const uint8_t *from, const uint8_t *to)
+{
+    uint64_t unit = s->width == 16 ? 16 : 8;
+    uint64_t q = s->va & ~(unit - 1);
+    unsigned off = (unsigned)(s->va - q);
+    if (off + (unsigned)s->n > unit) return 0;
+    DWORD old;
+    if (!VirtualProtect((void *)(uintptr_t)q, unit, PAGE_EXECUTE_READWRITE, &old)) return -1;
+    int ok = 0;
+    for (int tries = 0; tries < 8 && !ok; tries++) {
+        if (unit == 8) {
+            volatile uint64_t *qp = (volatile uint64_t *)(uintptr_t)q;
+            uint64_t cur = *qp, nv = cur;
+            uint8_t *bc = (uint8_t *)&cur, *bn = (uint8_t *)&nv;
+            if (!mem_eq(bc + off, from, s->n)) break;
+            for (int i = 0; i < s->n; i++) bn[off + i] = to[i];
+            ok = __sync_bool_compare_and_swap(qp, cur, nv);
+        } else {
+            volatile unsigned __int128 *qp = (volatile unsigned __int128 *)(uintptr_t)q;
+            unsigned __int128 cur = __sync_val_compare_and_swap(qp, (unsigned __int128)0, (unsigned __int128)0);  /* atomic read */
+            unsigned __int128 nv = cur;
+            uint8_t *bc = (uint8_t *)&cur, *bn = (uint8_t *)&nv;
+            if (!mem_eq(bc + off, from, s->n)) break;
+            for (int i = 0; i < s->n; i++) bn[off + i] = to[i];
+            ok = __sync_bool_compare_and_swap(qp, cur, nv);
+        }
+    }
+    DWORD tmp;
+    VirtualProtect((void *)(uintptr_t)q, unit, old, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), (void *)(uintptr_t)q, unit);
+    return ok;
+}
+
+/* serialise this thread's instruction stream after modifying code */
+static void pd_serialize(void)
+{
+    uint32_t a = 0, b, c = 0, d;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d) : : "memory");
+    (void)b; (void)d;
 }
 
 /* ---- install / remove -------------------------------------------------------------------- */
@@ -530,8 +528,13 @@ static int pd_supported(void)
         if (!mem_eq((const uint8_t *)(uintptr_t)g_pd_fps[i].va, g_pd_fps[i].bytes, g_pd_fps[i].n)) return 0;
     for (int i = 0; i < PD_NSITES; i++) {
         const struct pdsite *s = &g_pd_sites[i];
-        if ((s->va & 7) + (uint64_t)s->n > 8) return 0;
+        uint64_t unit = s->width == 16 ? 16 : 8;
+        if ((s->va & (unit - 1)) + (uint64_t)s->n > unit) return 0;
         if (!mem_eq((const uint8_t *)(uintptr_t)s->va, s->orig, s->n)) return 0;
+        if (s->kind == PK_REDIRECT) {                             /* original rel32 must reach the expected target */
+            int32_t rel = (int32_t)RD32(s->va + 1);
+            if (s->va + 5 + (int64_t)rel != s->target) return 0;
+        }
     }
     g_pd_supported = 1;
     return 1;
@@ -548,21 +551,20 @@ static int pd_prepare(void)
     if (!page) { log_line("diag: could not allocate the stub page near the game image"); return 0; }
     const uint64_t w[PD_NSITES] = {
         (uint64_t)(uintptr_t)&pd_w_impact, (uint64_t)(uintptr_t)&pd_w_post, (uint64_t)(uintptr_t)&pd_w_request,
-        (uint64_t)(uintptr_t)&pd_w_enter, (uint64_t)(uintptr_t)&pd_w_launch, (uint64_t)(uintptr_t)&pd_w_update,
-        (uint64_t)(uintptr_t)&pd_w_sos, (uint64_t)(uintptr_t)&pd_w_recover, (uint64_t)(uintptr_t)&pd_w_exit,
-        (uint64_t)(uintptr_t)&pd_w_purge};
-    if (!pd_build_page(page, (uint64_t)(uintptr_t)page, w, g_pd_sites, PD_NSITES)) {
+        (uint64_t)(uintptr_t)&pd_w_launch, (uint64_t)(uintptr_t)&pd_w_sos, (uint64_t)(uintptr_t)&pd_w_recover,
+        (uint64_t)(uintptr_t)&pd_w_exit, (uint64_t)(uintptr_t)&pd_w_purge_script, (uint64_t)(uintptr_t)&pd_w_purge_station};
+    uint64_t slots[PD_NSITES];
+    if (!pd_build_page(page, (uint64_t)(uintptr_t)page, w, g_pd_sites, PD_NSITES, slots)) {
         log_line("diag: stub page out of range");
-        return 0;                                  /* page stays allocated but unused */
+        return 0;
     }
-    for (int i = 0; i < PD_NSITES; i++) g_pd_tramp[i] = page + 0x40 * i + 0x20;
+    for (int i = 0; i < PD_NSITES; i++) g_pd_tramp[i] = (void *)(uintptr_t)slots[i];
     FlushInstructionCache(GetCurrentProcess(), page, 0x40 * PD_NSITES);
     __sync_synchronize();
     g_pd_page = page;
     return 1;
 }
 
-/* 0 all original, 1 all patched, -1 mixed/unknown */
 static int pd_code_state(void)
 {
     int off = 0, on = 0;
@@ -581,36 +583,33 @@ static int pd_set(int on)
     if (on && !pd_prepare()) return ST_PROTECT_FAIL;
     int cur = pd_code_state();
     if (cur == on) { g_pd_on = on; return on ? ST_ON : ST_OFF; }
-    if (cur < 0) { log_line("diag: hook sites in an unexpected state - not changed"); return ST_RACE; }
-    if (on) {                                     /* logging active before the first hook can fire */
-        if (!g_pd_t0) g_pd_t0 = GetTickCount64();
-        g_pd_on = 1;
-    }
-    /* install in order; remove in reverse order; roll back on any failure */
+    if (cur < 0) { log_line("diag: patch points in an unexpected state - not changed"); return ST_RACE; }
+    if (on) { if (!g_pd_t0) g_pd_t0 = GetTickCount64(); g_pd_on = 1; }
     int done = 0, err = 0;
     for (; done < PD_NSITES; done++) {
         int i = on ? done : PD_NSITES - 1 - done;
         const struct pdsite *s = &g_pd_sites[i];
-        int r = swap_bytes(s->va, s->n, on ? s->orig : s->patch, on ? s->patch : s->orig);
+        int r = pd_swap(s, on ? s->orig : s->patch, on ? s->patch : s->orig);
         if (r != 1) { err = r < 0 ? ST_PROTECT_FAIL : ST_RACE; break; }
     }
     if (err) {
         for (int k = done - 1; k >= 0; k--) {
             int i = on ? k : PD_NSITES - 1 - k;
             const struct pdsite *s = &g_pd_sites[i];
-            swap_bytes(s->va, s->n, on ? s->patch : s->orig, on ? s->orig : s->patch);
+            pd_swap(s, on ? s->patch : s->orig, on ? s->orig : s->patch);
         }
-        log_line("diag: hook change failed and was rolled back");
+        pd_serialize();
+        log_line("diag: patch change failed and was rolled back");
         if (on) g_pd_on = 0;
         return err;
     }
+    pd_serialize();
     int st = pd_code_state();
-    if (on) {
-        log_line(st == 1 ? "diag: 10 observation hooks installed and read back OK (no gameplay patches in this build)"
-                         : "diag: READ-BACK FAILED after install");
-    } else {
-        g_pd_on = 0;      /* events already in the ring are still written by the next report */
-        log_line(st == 0 ? "diag: hooks removed, original code read back OK" : "diag: READ-BACK FAILED after removal");
+    if (on) log_line(st == 1 ? "diag: 9 single-instruction observation patches installed and read back OK (no gameplay patches in this build)"
+                             : "diag: READ-BACK FAILED after install");
+    else {
+        g_pd_on = 0;
+        log_line(st == 0 ? "diag: patches removed, original instructions read back OK" : "diag: READ-BACK FAILED after removal");
     }
     return on ? ST_ON : ST_OFF;
 }
@@ -628,20 +627,19 @@ static const char *pd_caller(uint64_t ret)
     switch (ret) {
     case 0x1406b5ae1ULL: return "impact receiver";
     case 0x1406b50c1ULL: return "0x1406b4c30 (pending-request path)";
-    case 0x1406a8ca2ULL: return "request receiver";
     case 0x14408ee69ULL: return "protected caller 0x14408ee20";
     case 0x14067fcbaULL: return "guest-physics update";
-    case 0x14069c8d1ULL: return "enter Physics";
-    case 0x14081bb14ULL: return "destroyed-vehicle listener";
+    case RET_FROM_ENTER: return "enter-Physics";
+    case RET_FROM_RECOVER: return "recovery receiver";
     case 0x14046c09eULL: return "script rides:PurgeAllRideGuests";
-    case 0x140856a8bULL: return "station purge (0x140856a40)";
-    case 0x1405d4041ULL: case 0x1405d4088ULL: return "train-removed handler";
+    case 0x140856a8bULL: return "station purge";
     default: return 0;
     }
 }
+static char *pd_val(char *p, uint64_t v) { return v == NOTREAD ? fmt_str(p, "(not read)") : fmt_u64(p, v); }
 static char *pd_checks(char *p, uint64_t e)
 {
-    static const char *pred[] = {"predicted REJECT", "predicted ACCEPT", "needs extra check 0x1406cdf90 (not evaluated)", "n/a"};
+    static const char *pred[] = {"predicted REJECT", "predicted ACCEPT", "needs extra check 0x1406cdf90 (not evaluated; later checks not read)", "n/a"};
     p = fmt_str(p, " checks: +8="); p = fmt_u64(p, e & 0xff);
     p = fmt_str(p, " beh="); p = fmt_str(p, pd_beh_name((e >> 16) & 0xff));
     p = fmt_str(p, " +9="); p = fmt_u64(p, (e >> 8) & 0xff);
@@ -653,77 +651,56 @@ static char *pd_checks(char *p, uint64_t e)
 
 static void pd_line(const struct pd_ev *v, uint64_t idx)
 {
-    char b[400], *p = b;
+    char b[420], *p = b;
     p = fmt_str(p, "pd #"); p = fmt_u64(p, idx + 1);
     p = fmt_str(p, " t="); p = fmt_u64(p, v->t - g_pd_t0); p = fmt_str(p, "ms tid="); p = fmt_u64(p, v->tid); *p++ = ' ';
     switch (v->kind) {
     case K_IMPACT:
-        p = fmt_str(p, "ENTRY impact-event guest="); p = fmt_u64(p, v->a);
-        if (v->b == 0xffffffffULL) p = fmt_str(p, " grp=(not in guest->group map)");
-        else { p = fmt_str(p, " grp="); p = fmt_u64(p, v->b); }
-        p = fmt_str(p, " reason="); p = fmt_u64(p, v->c); p = fmt_str(p, " src="); p = fmt_hex(p, v->d);
-        if (((v->e >> 36) & 3) == PRED_NA && !((v->e >> 38) & 1)) p = fmt_str(p, " => predicted REJECT (no group)");
-        else if (!((v->e >> 39) & 1)) p = fmt_str(p, " => predicted REJECT (per-group entry mismatch)");
+        p = fmt_str(p, "ENTRY impact-event(msg 0) guest="); p = fmt_u64(p, v->a);
+        if (v->b == NOTREAD) p = fmt_str(p, " grp=(not in guest->group map) => predicted REJECT");
         else {
-            p = pd_checks(p, v->e);
-            uint64_t pend = (v->e >> 33) & 3;
-            p = fmt_str(p, pend == 1 ? " (request already pending)" : pend == 2 ? " (no pending requests)" : "");
+            p = fmt_str(p, " grp="); p = fmt_u64(p, v->b);
+            if (!((v->e >> 39) & 1)) p = fmt_str(p, " => predicted REJECT (per-group entry mismatch)");
+            else {
+                p = fmt_str(p, " reason="); p = pd_val(p, v->c); p = fmt_str(p, " src="); p = v->d == NOTREAD ? fmt_str(p, "(not read)") : fmt_hex(p, v->d);
+                p = pd_checks(p, v->e);
+                uint64_t pend = (v->e >> 33) & 3;
+                p = fmt_str(p, pend == 1 ? " (request already pending)" : "");
+            }
         }
+        if ((v->e >> 40) & 1) p = fmt_str(p, " [more messages in this batch: not examined]");
         break;
     case K_POST:
-        p = fmt_str(p, "ENTRY post-group-request grp="); p = fmt_u64(p, v->a);
-        p = fmt_str(p, " reason="); p = fmt_u64(p, v->b); p = fmt_str(p, " src="); p = fmt_hex(p, v->c);
+        p = fmt_str(p, "ENTRY post-group-request grp="); p = pd_val(p, v->a);
         break;
     case K_REQUEST:
-        p = fmt_str(p, "ENTRY request-receiver grp="); p = fmt_u64(p, v->a);
-        p = fmt_str(p, " reason="); p = fmt_u64(p, v->b); p = fmt_str(p, " src="); p = fmt_hex(p, v->c);
+        p = fmt_str(p, "ENTRY request-receiver(msg 0) grp="); p = fmt_u64(p, v->a);
+        p = fmt_str(p, " reason="); p = pd_val(p, v->b); p = fmt_str(p, " src="); p = fmt_hex(p, v->c);
         p = pd_checks(p, v->e);
-        break;
-    case K_ENTER:
-        p = fmt_str(p, "ENTRY enter-Physics grp="); p = fmt_u64(p, v->a);
-        p = fmt_str(p, " previous beh="); p = fmt_str(p, pd_beh_name(v->b));
-        p = fmt_str(p, " reason="); p = fmt_u64(p, v->c); p = fmt_str(p, " members="); p = fmt_u64(p, v->d);
-        break;
-    case K_MEMBER:
-        p = fmt_str(p, "ENTRY enter-Physics grp="); p = fmt_u64(p, v->a);
-        p = fmt_str(p, " member#"); p = fmt_u64(p, v->c); p = fmt_str(p, " guest="); p = fmt_u64(p, v->b);
+        if ((v->e >> 40) & 1) p = fmt_str(p, " [more messages in this batch: not examined]");
         break;
     case K_LAUNCH:
-        p = fmt_str(p, "ENTRY physics-start guest="); p = fmt_u64(p, v->a); p = fmt_str(p, " key(grp)="); p = fmt_u64(p, v->b);
-        break;
-    case K_GUESTMAP:
-        p = fmt_str(p, v->b ? "STATE guest ENTERED physics guest map guest=" : "STATE guest LEFT physics guest map guest=");
-        p = fmt_u64(p, v->a); p = fmt_str(p, " key(grp)="); p = fmt_u64(p, v->c);
-        p = fmt_str(p, " timer-bits="); p = fmt_hex(p, v->d); p = fmt_str(p, " incident-counter="); p = fmt_u64(p, v->e);
-        break;
-    case K_GROUPKEY:
-        p = fmt_str(p, v->b ? "STATE incident group PRESENT key(grp)=" : "STATE incident group REMOVED key(grp)=");
-        p = fmt_u64(p, v->a); p = fmt_str(p, " (tracked via guest "); p = fmt_u64(p, v->c); *p++ = ')';
+        p = fmt_str(p, "ENTRY physics-start guest="); p = pd_val(p, v->a); p = fmt_str(p, " key(grp)="); p = fmt_u64(p, v->b);
+        if (v->a == NOTREAD) p = fmt_str(p, " (guest id pointer not on this thread's stack: not read)");
         break;
     case K_SOS:
-        p = fmt_str(p, "ENTRY SOS-step guest="); p = fmt_u64(p, v->a);
+        p = fmt_str(p, "ENTRY SOS-step guest="); p = pd_val(p, v->a);
         break;
     case K_RECOVER:
-        p = fmt_str(p, "ENTRY recovery-receiver grp="); p = fmt_u64(p, v->a);
+        p = fmt_str(p, "ENTRY recovery-receiver(msg 0) grp="); p = fmt_u64(p, v->a);
         p = fmt_str(p, " beh="); p = fmt_str(p, pd_beh_name(v->b));
         p = fmt_str(p, " +8="); p = fmt_u64(p, v->c); p = fmt_str(p, " +9="); p = fmt_u64(p, v->d);
-        p = fmt_str(p, v->e ? " => predicted PROCEED" : " => predicted SKIP");
+        p = fmt_str(p, (v->e & 1) ? " => predicted PROCEED" : " => predicted SKIP");
+        if (v->e & 2) p = fmt_str(p, " [more messages in this batch: not examined]");
         break;
-    case K_EXITPHYS:
-        p = fmt_str(p, "ENTRY exit-behaviour(Physics) grp="); p = fmt_u64(p, v->a);
-        p = fmt_str(p, " members="); p = fmt_u64(p, v->b); p = fmt_str(p, " +0x1b="); p = fmt_u64(p, v->c);
-        p = fmt_str(p, " handle="); p = fmt_hex(p, v->d);
-        break;
-    case K_EXITMEMBER:
-        p = fmt_str(p, "ENTRY exit-behaviour(Physics) grp="); p = fmt_u64(p, v->a);
-        p = fmt_str(p, " member#"); p = fmt_u64(p, v->c); p = fmt_str(p, " guest="); p = fmt_u64(p, v->b);
+    case K_EXIT:
+        p = fmt_str(p, "ENTRY exit-behaviour grp="); p = pd_val(p, v->a);
+        p = fmt_str(p, " +0x1b="); p = fmt_u64(p, v->b); p = fmt_str(p, " handle=");
+        p = v->c == NOTREAD ? fmt_str(p, "(none)") : fmt_hex(p, v->c);
         break;
     case K_PURGE:
-        p = fmt_str(p, "SANITY purge (unloading) ids="); p = fmt_u64(p, v->a);
+        p = fmt_str(p, "SANITY purge ids="); p = fmt_u64(p, v->a);
         if (v->a) { p = fmt_str(p, " first="); p = fmt_u64(p, v->b); }
-        break;
-    case K_UNTRACKED:
-        p = fmt_str(p, "NOTE launch not tracked (table full) guest="); p = fmt_u64(p, v->a);
         break;
     default:
         p = fmt_str(p, "?");
@@ -747,7 +724,7 @@ static void pd_report(void)
         uint64_t i = g_pd_tail;
         struct pd_ev *slot = &g_pd_ring[i & (PD_RING - 1)];
         uint64_t s1 = slot->seq;
-        if (s1 == 0 || s1 < i + 1) break;            /* still being written */
+        if (s1 == 0 || s1 < i + 1) break;
         __sync_synchronize();
         struct pd_ev v = *slot;
         __sync_synchronize();
@@ -777,7 +754,7 @@ __declspec(dllexport) int irs_pd_status(void *L)
 }
 __declspec(dllexport) int irs_pd_report(void *L) { (void)L; pd_report(); return 1; }
 
-/* helper -> scripts: next id. 2 = none, 3 = group index, 4 = guest id; then 64 x irs_pd_bit (MSB first): 1 = set, 2 = clear */
+/* helper -> scripts: irs_pd_next returns 2 = none, 3 = group index, 4 = guest id; then 64 x irs_pd_bit (MSB first): 1 set, 2 clear */
 static uint64_t g_pd_cur;
 __declspec(dllexport) int irs_pd_next(void *L)
 {
@@ -799,7 +776,7 @@ __declspec(dllexport) int irs_pd_bit(void *L)
     return b ? 1 : 2;
 }
 
-/* scripts -> helper: values via begin / bit0 / bit1 / push, then irs_pd_note */
+/* scripts -> helper: begin / bit0 / bit1 / push, then irs_pd_note */
 #define PD_NOTE_MAX 8
 static uint64_t g_pd_acc, g_pd_vals[PD_NOTE_MAX];
 static int g_pd_nvals;
@@ -813,32 +790,39 @@ __declspec(dllexport) int irs_pd_push(void *L)
     g_pd_acc = 0;
     return 1;
 }
-/* notes: [1, guest, scriptGroupId+1 (0 = none)] ; [2, grp, behaviour code+1 (0 = unreadable)] ; [3, nGuestsInvolved] ; [4, trapped count] */
+/* notes (script thread, public script functions):
+ *  [1, guest, GetGuestGroupID+1 | 0]                     [2, grp, displayed behaviour+1 | 0]
+ *  [3, nGuestsInvolved]                                  [4, trapped count]
+ *  [5, grp, member count, up to 5 member guest ids]      */
 __declspec(dllexport) int irs_pd_note(void *L)
 {
     (void)L;
     if (g_pd_nvals < 1) return 2;
     uint64_t k = g_pd_vals[0], a = g_pd_nvals > 1 ? g_pd_vals[1] : 0, c = g_pd_nvals > 2 ? g_pd_vals[2] : 0;
-    char b[200], *p = b;
-    p = fmt_str(p, "pd t="); p = fmt_u64(p, GetTickCount64() - g_pd_t0); p = fmt_str(p, "ms SCRIPT ");
+    char b[320], *p = b;
+    p = fmt_str(p, "pd t="); p = fmt_u64(p, GetTickCount64() - g_pd_t0); p = fmt_str(p, "ms tid="); p = fmt_u64(p, GetCurrentThreadId());
     switch (k) {
     case 1:
-        p = fmt_str(p, "guest="); p = fmt_u64(p, a);
-        if (c) { p = fmt_str(p, " GetGuestGroupID="); p = fmt_u64(p, c - 1); }
-        else p = fmt_str(p, " GetGuestGroupID=(none/unreadable)");
+        p = fmt_str(p, " SCRIPT guest="); p = fmt_u64(p, a);
+        if (c) { p = fmt_str(p, " GetGuestGroupID="); p = fmt_u64(p, c - 1); } else p = fmt_str(p, " GetGuestGroupID=(none/unreadable)");
         break;
     case 2:
-        p = fmt_str(p, "STATE grp="); p = fmt_u64(p, a); p = fmt_str(p, " displayed behaviour now ");
+        p = fmt_str(p, " STATE grp="); p = fmt_u64(p, a); p = fmt_str(p, " displayed behaviour now ");
         p = fmt_str(p, c ? pd_beh_name(c - 1) : "(unreadable)");
         break;
     case 3:
-        p = fmt_str(p, "message GuestPhysicsIncidentEnded received, nGuestsInvolved="); p = fmt_u64(p, a);
+        p = fmt_str(p, " STATE message GuestPhysicsIncidentEnded received, nGuestsInvolved="); p = fmt_u64(p, a);
         break;
     case 4:
-        p = fmt_str(p, "trapped (SOS) guests now "); p = fmt_u64(p, a);
+        p = fmt_str(p, " STATE trapped (SOS) guests now "); p = fmt_u64(p, a);
+        break;
+    case 5:
+        p = fmt_str(p, " STATE grp="); p = fmt_u64(p, a); p = fmt_str(p, " members ("); p = fmt_u64(p, c); p = fmt_str(p, "):");
+        for (int i = 3; i < g_pd_nvals; i++) { *p++ = ' '; p = fmt_u64(p, g_pd_vals[i]); }
+        if (c + 3 > (uint64_t)g_pd_nvals) p = fmt_str(p, " ...");
         break;
     default:
-        p = fmt_str(p, "note "); p = fmt_u64(p, k);
+        p = fmt_str(p, " note "); p = fmt_u64(p, k);
     }
     *p = 0; log_line(b);
     return 1;

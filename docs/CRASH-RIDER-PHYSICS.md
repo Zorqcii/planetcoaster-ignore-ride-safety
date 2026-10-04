@@ -140,6 +140,75 @@ taken (no status line, no logging). Nothing here changes the "Unresolved" table.
 **Still open from the proposal:** the displayed status, group-wide behaviour (members checked), recovery duration, and any stranded guests.
 These would need a repeat under the original conditions: disposable copy, all options off, empty test run.
 
+### diag.2 revision 2 (built and statically verified 2026-10-04; NOT installed, awaiting approval)
+Superseding the plan below after the owner's review: (1) unproven-concurrency reads removed, (2) only single-instruction patch points.
+
+**Patch points (9):** each replaces ONE instruction with ONE instruction of the same length at the same address, in one atomic
+aligned 8- or 16-byte compare-exchange (`lock cmpxchg` / `lock cmpxchg16b`). No thread can be part-way through a patched span; it
+either executes the old or the new complete instruction, or has passed it.
+
+| # | Point | Kind | Unit |
+|---|---|---|---|
+| P1 | `0x1406f1fa4` jmp → impact receiver | redirect (dispatcher jump) | 16 |
+| P2 | `0x1406f0a00` post group request, first instruction | entry | 8 |
+| P3 | `0x1406f2634` jmp → request receiver | redirect | 16 |
+| P4 | `0x14067d450` physics start, first instruction | entry | 8 |
+| P5 | `0x140680af0` SOS step, first instruction | entry | 8 |
+| P6 | `0x1406f2594` jmp → recovery receiver | redirect | 16 |
+| P7 | `0x14069cec0` exit behaviour, first instruction | entry | 8 |
+| P8 | `0x14046c099` call purge (script binding) | redirect | 8 |
+| P9 | `0x140856a86` call purge (station purge) | redirect | 16 |
+
+The three receivers are reached only through these dispatcher jumps, so coverage is complete. Not patchable this way, and dropped:
+* enter-Physics: its entry is multi-instruction and its single call site straddles a 16-byte block. Entry is evidenced by its first
+  step, the unconditional call to exit-behaviour (P7, return address `0x14069c8d1`);
+* the crash-time purge call (`0x14081bb0f`, straddles a 16-byte block). The unloading sanity check covers only script and station purges;
+* the per-tick physics-update hook (removed with its reads; see below).
+
+**Read policy:** hook bodies read only:
+* register values;
+* memory on the current thread's own stack, checked at run time against the thread's stack bounds;
+* game memory that the observed routine itself reads on that call **before any call, lock-prefixed instruction, xchg-with-memory or
+  syscall** on its own path. This was verified offline for every mirrored read: impact receiver 27 reads, request receiver 12,
+  recovery receiver 8, exit behaviour 2, purge 3. The physics-start group key is read by its first callee's first memory instruction
+  after a straight-line path. Only **message 0** of a batch is examined, because later messages are read by the game after calls.
+**Confirmed STATE** comes only from the game's public script functions on the script thread: displayed group behaviour, group
+members, guest→group id, the trapped count, and the `GuestPhysicsIncidentEnded` message.
+
+**No longer confirmable (accepted loss):**
+* per-guest presence in the physics guest map and incident-group presence/removal; incident timer and counter values;
+* previous behaviour and member list at the moment of enter-Physics (the scripts sample every 0.5 s and may miss short states);
+* request reason/source at the post step; the motion vectors; messages after the first in a batch;
+* source and pending checks when the reason-2 extra check applies;
+* guest ids at launch or SOS when the id pointer is not on the calling thread's stack (logged as "not read");
+* crash-time unloading.
+
+**Checks run against the final package** (DLL `3d98c82c…`, ZIP sha256 `4a16d073…`):
+* the 9 points: original bytes, single instruction, inside one aligned unit, no RIP-relative addressing, redirect targets correct;
+* 61 build-check ranges match;
+* no real branch, function-table entry or absolute pointer into any patched instruction's interior;
+* RAX/R10/R11/XMM4/XMM5/flags are never read before being written in any of the 8 observed routines (all paths, including the
+  exit-behaviour switch);
+* all mirrored reads lie in the pre-call/pre-sync region (above);
+* the 9 wrappers match the template and use their own trampoline slot; `pd_swap` uses `lock cmpxchg16b` and `lock cmpxchg`;
+* the stub-page builder, run natively: stubs, entry trampolines, redirect slots (= original targets) and patch instructions all correct;
+* the read-only lookups give 480/480 identical results to the game's code in an emulator;
+* the package: a fresh build is byte-identical; no experimental, diag.1 or prototype exports or strings; the site table inside the DLL
+  matches; the scripts in `Main.ovl` equal the source; the versions read 0.2.0-diag.2.
+
+**Remaining limits:**
+* Cross-modifying code: other cores are not forced to serialise. They may briefly keep executing the old instruction, which is valid,
+  before seeing the new one. The patching thread serialises (`cpuid`). Intel/AMD document serialisation as the guaranteed protocol,
+  so non-tearing of an unserialised fetch of a single aligned instruction is relied on (common hot-patching practice), not proven here.
+* Same-thread equivalence: mirrored reads happen under the same conditions as the game's own unsynchronised reads; if the game itself
+  races, so would these reads. No synchronisation of the game's structures was established beyond the game's own pattern.
+* Patch-time `VirtualProtect`/`FlushInstructionCache` run without suspending other threads. No thread suspension is used.
+* Predictions are logged as predictions; message pairings remain inferred; launch and teardown internals stay hidden.
+
+**Test park:** the archived pre-test backup (2026-10-03 05:10) shows that 12 named parks in the live save folder are byte-identical to
+it, so they are known pre-mod and pre-prototype. The main park ("ahhhh") and the two "IRS Test" copies are not in that backup and are
+not used. The test uses a Save-As copy of one verified park; the original and the main park are re-checked by hash afterwards.
+
 ### Plan: logging-only diagnostic 0.2.0-diag.2 for natural bystander physics (proposal, not built)
 Goal: connect one natural impact to its group request, Physics entry, per-guest launch and recovery, using real guest and group IDs.
 **No injected launch, no state change, no bypassed check.** The rider prototype stays blocked, and its code (`irs_proto.c`) is **not part of

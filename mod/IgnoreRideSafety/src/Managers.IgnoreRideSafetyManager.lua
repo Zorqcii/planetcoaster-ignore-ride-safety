@@ -223,6 +223,26 @@ IgnoreRideSafetyManager.PdTick = function(self)
       g.nLast = nCode
       self:PdNote({2, nGroup, nCode})
     end
+    -- members through the public script function; logged when the member list changes
+    local bOkM, tMembers = pcall(tW.guests.GetGuestsInGroup, tW.guests, nGroup)
+    if bOkM and type(tMembers) == "table" then
+      local tIds = {}
+      for _, v in ipairs(tMembers) do
+        local n = ToInteger(v)
+        if n ~= nil then
+          tIds[#tIds + 1] = n
+        end
+      end
+      local sKey = table.concat(tIds, ",")
+      if sKey ~= g.sMembers then
+        g.sMembers = sKey
+        local tNote = {5, nGroup, #tIds}
+        for i = 1, math.min(5, #tIds) do
+          tNote[#tNote + 1] = tIds[i]
+        end
+        self:PdNote(tNote)
+      end
+    end
     if self.nClock - g.nSince > 600 then
       p.tGroups[nGroup] = nil
       p.nGroups = p.nGroups - 1

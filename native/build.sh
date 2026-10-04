@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 OUT=${1:-build}
 # IRS_VARIANT=physdiag builds the logging-only diagnostic 0.2.0-diag.2 (no gameplay patches, no prototype code)
 DEFS=""
-if [ "${IRS_VARIANT:-}" = "physdiag" ]; then DEFS="-DIRS_PHYSDIAG"; fi
+if [ "${IRS_VARIANT:-}" = "physdiag" ]; then DEFS="-DIRS_PHYSDIAG -mcx16"; fi   # cmpxchg16b for 16-byte atomic patch units
 mkdir -p "$OUT"
 llvm-dlltool -m i386:x86-64 -d kernel32.def -l "$OUT/kernel32.lib"
 clang --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin -fno-stack-protector \
